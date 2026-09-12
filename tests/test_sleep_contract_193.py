@@ -235,6 +235,7 @@ def test_orphan_vec_failure_rolls_back_ordinary_row(tmp_path):
     )
     assert conn.execute("SELECT count(*) FROM embeddings").fetchone()[0] == 0
     assert stats["orphan_write_failed"] == 1
+    assert stats.get("orphan_ordinary_written", 0) == 0
     conn.close()
 
 
@@ -373,6 +374,62 @@ def test_public_cycle_reports_committed_prefix_when_later_phase_fails(tmp_path, 
     check = sqlite3.connect(str(path))
     assert check.execute("SELECT count(*) FROM derivation_edges").fetchone()[0] == 2
     check.close()
+
+
+def test_early_orphan_commit_survives_candidate_discovery_failure(tmp_path, monkeypatch):
+    conn = _orphan_db(tmp_path)
+    vector = np.ones(384, dtype=np.float32).tobytes()
+    conn.execute(
+        "INSERT INTO embeddings VALUES ('anchor', ?, 'all-MiniLM-L6-v2', datetime('now'))",
+        (vector,),
+    )
+    conn.execute("INSERT INTO thought_nodes(id, content) VALUES ('anchor', 'anchor')")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(
+        sleep_module, "_find_pairs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("discovery")),
+    )
+    result = run_sleep_cycle(
+        db_path=str(tmp_path / "orphans.db"),
+        embedding_client=_Client(lambda n: np.ones((n, 384), dtype=np.float32)),
+        embedding_model="all-MiniLM-L6-v2",
+        expected_dimension=384,
+        journal_policy="preserve",
+    )
+    assert result["status"] == "partial"
+    assert result["error"] == "sleep_cycle_failed"
+    assert result["orphans_embedded"] == 2
+    assert result["orphan_ordinary_written"] == 2
+
+
+def test_late_orphan_failure_retains_committed_dream_fields(tmp_path, monkeypatch):
+    path = _cycle_db(tmp_path, "dream-orphan-failure.db")
+    conn = sqlite3.connect(str(path))
+    v1 = np.zeros(1024, dtype=np.float32)
+    v1[0] = 1.0
+    v2 = np.zeros(1024, dtype=np.float32)
+    v2[0] = 0.92
+    v2[1] = np.sqrt(1.0 - 0.92 ** 2)
+    conn.execute("UPDATE thought_nodes SET source_file='one.md' WHERE id='a'")
+    conn.execute("UPDATE thought_nodes SET source_file='two.md' WHERE id='b'")
+    conn.execute("INSERT INTO thought_nodes(id, content) VALUES ('orphan', 'late orphan')")
+    conn.execute("UPDATE embeddings SET vector=? WHERE node_id='a'", (v1.tobytes(),))
+    conn.execute("UPDATE embeddings SET vector=? WHERE node_id='b'", (v2.tobytes(),))
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(
+        sleep_module, "_embed_orphans",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("orphan")),
+    )
+    result = run_sleep_cycle(
+        db_path=str(path),
+        model_fn=lambda _prompt: "A durable relationship connects these observations.",
+        journal_policy="preserve",
+    )
+    assert result["status"] == "partial"
+    assert result["dream_generation"] == "ran"
+    assert result["dream_id"]
 
 
 def _force_late_dream_failure(monkeypatch):
@@ -559,6 +616,8 @@ def test_public_cycle_reports_ordinary_only_orphan_write(tmp_path):
         expected_dimension=384,
         journal_policy="preserve",
     )
+    assert result["status"] == "partial"
+    assert result["error"] == "vec_capability_unavailable"
     assert result["orphan_ordinary_written"] == 1
     assert result["orphan_vec_unavailable"] == 1
     check = sqlite3.connect(str(tmp_path / "orphans.db"))

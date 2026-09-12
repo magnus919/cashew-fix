@@ -942,17 +942,20 @@ def _embed_orphans(
                     "INSERT OR REPLACE INTO embeddings (node_id, vector) VALUES (?, ?)",
                     (nid, blob),
                 )
-            stats["orphan_ordinary_written"] += 1
             if vec_available:
                 conn.execute(
                     "INSERT OR REPLACE INTO vec_embeddings "
                     "(node_id, embedding) VALUES (?, ?)",
                     (nid, blob),
                 )
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            # Count only after the savepoint has released successfully. A
+            # failed vec write must not claim an ordinary row that rolled back.
+            stats["orphan_ordinary_written"] += 1
+            if vec_available:
                 embedded += 1
             else:
                 stats["orphan_vec_unavailable"] += 1
-            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
         except Exception as exc:
             try:
                 conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
@@ -1192,9 +1195,27 @@ def run_sleep_cycle(
             ).fetchall()
             ids = [r[0] for r in rows]
             valid_ids, matrix = _load_embedding_matrix(conn, ids, expected_dimension)
+            progress.update({
+                "nodes_selected": len(ids),
+                "nodes_with_embeddings": len(valid_ids),
+                "orphans_embedded": orphans,
+                "orphan_ordinary_written": orphan_stats.get(
+                    "orphan_ordinary_written", 0
+                ),
+            })
             if len(valid_ids) < 2:
                 conn.close()
-                result = _empty_sleep_result("unavailable", "too_few_embeddings",
+                durable = bool(
+                    orphans or orphan_stats.get("orphan_ordinary_written", 0)
+                )
+                error = (
+                    "orphan_write_failed" if orphan_stats.get("orphan_write_failed")
+                    else "vec_capability_unavailable"
+                    if orphan_stats.get("orphan_vec_unavailable")
+                    else "too_few_embeddings"
+                )
+                result = _empty_sleep_result(
+                    "partial" if durable else "unavailable", error,
                                              time.perf_counter() - t_start)
                 result["nodes_selected"] = len(ids)
                 result["nodes_with_embeddings"] = len(valid_ids)
@@ -1311,6 +1332,11 @@ def run_sleep_cycle(
             else:
                 dream_id = _generate_dream(conn, cross_link_tuples, model_fn=model_fn)
         progress["dream_id"] = dream_id
+        progress["dream_generation"] = (
+            "pending" if dream_pending else ("ran" if dream_id else "skipped")
+        )
+        if model_fn is not None and cross_link_tuples and not background_dream and dream_id is None:
+            progress["dream_generation"] = "failed"
 
         # Phase 9: embed orphans
         if background_dream:
