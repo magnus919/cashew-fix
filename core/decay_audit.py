@@ -5,7 +5,8 @@ Single helper that all decay execution sites call so the `decay_audit` table
 records every transition from live → decayed. Decay decision logic lives in
 the call sites; this module only writes audit rows.
 
-Schema (decay_audit) is created elsewhere; we only INSERT here.
+The schema is created lazily by :func:`ensure_decay_audit_schema` so sleep can
+upgrade legacy databases before the first audit write.
 """
 
 import json
@@ -23,6 +24,35 @@ DECAY_REASONS = (
 )
 
 _SUMMARY_LEN = 80
+
+
+def ensure_decay_audit_schema(conn: sqlite3.Connection) -> None:
+    """Create the additive decay-audit table before any audit write.
+
+    This is deliberately idempotent and does not alter graph tables.  Older
+    brains may have no audit table at all; creating it on the already-open
+    connection preserves their rows and makes subsequent decay decisions
+    observable.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS decay_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_id TEXT NOT NULL,
+            content_summary TEXT,
+            decay_reason TEXT,
+            confidence_at_decay REAL,
+            access_count_at_decay INTEGER,
+            last_access_date TEXT,
+            related_nodes TEXT,
+            source_file TEXT,
+            domain TEXT,
+            node_type TEXT,
+            decay_timestamp TEXT,
+            metadata TEXT
+        )
+        """
+    )
 
 
 def _summary(content: Optional[str]) -> str:

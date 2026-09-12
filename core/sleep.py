@@ -37,7 +37,7 @@ import numpy as np
 logger = logging.getLogger("cashew.sleep")
 
 from .config import get_db_path, config, DEFAULT_EMBEDDING_MODEL
-from .decay_audit import log_decay_event, gc_decay_audit
+from .decay_audit import log_decay_event, gc_decay_audit, ensure_decay_audit_schema
 
 # ── module-level defaults (tunable) ──────────────────────────────────────
 
@@ -137,18 +137,16 @@ def _parse_ts(value: Optional[str]) -> Optional[datetime]:
 
 
 def _resolve_expected_dim() -> int:
-    """Configured embedding model's dim, with a MiniLM fallback if the
-    embedding service cannot be constructed (e.g. in CI without the model
-    cached)."""
+    """Configured profile dimension without constructing an embedding model."""
     try:
-        from .embedding_service import get_default_service
-        return get_default_service().dim
+        return _get_active_profile().dim
     except Exception:
         return 384
 
 
 def _load_embedding_matrix(
     conn: sqlite3.Connection, node_ids: List[str],
+    expected_dimension: Optional[int] = None,
 ) -> Tuple[List[str], np.ndarray]:
     """Load embeddings for *node_ids* from the ``embeddings`` table.
 
@@ -167,7 +165,10 @@ def _load_embedding_matrix(
         node_ids,
     ).fetchall()
 
-    expected_dim = _resolve_expected_dim()
+    expected_dim = (
+        int(expected_dimension)
+        if expected_dimension is not None else _resolve_expected_dim()
+    )
 
     vectors: List[np.ndarray] = []
     valid_ids: List[str] = []
@@ -211,6 +212,8 @@ def _load_embedding_matrix(
 
 def _find_pairs(
     ids: List[str], matrix: np.ndarray,
+    cross_threshold: Optional[float] = None,
+    dedup_threshold: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return (cross_link_pairs, dedup_pairs, similarity_matrix).
 
@@ -227,8 +230,12 @@ def _find_pairs(
     )
 
     upper = np.triu(sim, k=1)
-    cross_mask = (upper >= CROSS_LINK_THRESHOLD) & (upper < DEDUP_THRESHOLD)
-    dedup_mask = upper >= DEDUP_THRESHOLD
+    cross_threshold = (
+        CROSS_LINK_THRESHOLD if cross_threshold is None else cross_threshold
+    )
+    dedup_threshold = DEDUP_THRESHOLD if dedup_threshold is None else dedup_threshold
+    cross_mask = (upper >= cross_threshold) & (upper < dedup_threshold)
+    dedup_mask = upper >= dedup_threshold
 
     cross_pairs = np.argwhere(cross_mask)
     dedup_pairs = np.argwhere(dedup_mask)
@@ -262,17 +269,34 @@ def _batch_cross_links(
     stats = {
         "candidates": len(cross_pairs),
         "created": 0,
+        "repaired": 0,
         "skipped": 0,
+        "directed_rows": 0,
         "same_source_skipped": 0,
         "capped": False,
     }
     pending: List[Tuple[str, str, float]] = []
     t0 = time.perf_counter()
 
+    def flush() -> None:
+        nonlocal pending
+        if pending:
+            conn.executemany(
+                "INSERT OR IGNORE INTO derivation_edges "
+                "(parent_id, child_id, weight, reasoning) VALUES (?, ?, ?, ?)",
+                [
+                    (p, c, w, f"cross_link - similarity={w:.3f}")
+                    for p, c, w in pending
+                ],
+            )
+            conn.commit()
+            pending.clear()
+
     for batch_start in range(0, len(cross_pairs), EDGES_PER_BATCH):
         batch = cross_pairs[batch_start:batch_start + EDGES_PER_BATCH]
         for i, j in batch:
-            if max_edges is not None and stats["created"] >= max_edges:
+            if (max_edges is not None
+                    and (stats["created"] + stats["repaired"]) >= max_edges):
                 stats["capped"] = True
                 break
             n1 = ids[int(i)]
@@ -284,39 +308,37 @@ def _batch_cross_links(
                 if sf1 and sf2 and sf1 == sf2:
                     stats["same_source_skipped"] += 1
                     continue
-            row = conn.execute(
-                "SELECT COUNT(*) FROM derivation_edges "
+            directions = conn.execute(
+                "SELECT parent_id, child_id FROM derivation_edges "
                 "WHERE (parent_id=? AND child_id=?) OR (parent_id=? AND child_id=?)",
                 (n1, n2, n2, n1),
-            ).fetchone()
-            if row[0] > 0:
+            ).fetchall()
+            present = {(p, c) for p, c in directions}
+            if len(present) == 2:
                 stats["skipped"] += 1
                 continue
             sim_val = float(sim[int(i), int(j)])
-            pending.append((n1, n2, sim_val))
-            pending.append((n2, n1, sim_val))
-            stats["created"] += 1
+            missing = [(n1, n2), (n2, n1)]
+            missing = [(p, c) for p, c in missing if (p, c) not in present]
+            pending.extend((p, c, sim_val) for p, c in missing)
+            if len(present) == 1:
+                stats["repaired"] += 1
+            else:
+                stats["created"] += 1
+            stats["directed_rows"] += len(missing)
 
-        if max_edges is not None and stats["created"] >= max_edges:
+        if (max_edges is not None
+                and (stats["created"] + stats["repaired"]) >= max_edges):
             stats["capped"] = True
+            flush()
             break
 
-        if pending:
-            conn.executemany(
-                "INSERT OR IGNORE INTO derivation_edges "
-                "(parent_id, child_id, weight, reasoning) VALUES (?, ?, ?, ?)",
-                [
-                    (p, c, w, f"cross_link - similarity={w:.3f}")
-                    for p, c, w in pending
-                ],
-            )
-            conn.commit()
-        pending.clear()
+        flush()
 
     elapsed = time.perf_counter() - t0
     logger.info(
-        "sleep: cross-links %d created, %d skipped in %.1fs",
-        stats["created"], stats["skipped"], elapsed,
+        "sleep: cross-links %d created, %d repaired, %d skipped in %.1fs",
+        stats["created"], stats["repaired"], stats["skipped"], elapsed,
     )
     return stats
 
@@ -804,68 +826,121 @@ def _generate_dream(
 # ── Phase 9: orphan embedding ────────────────────────────────────────────
 
 
-def _embed_orphans(conn: sqlite3.Connection) -> int:
-    """Embed any active nodes lacking an embedding row. Returns count."""
+def _embed_orphans(
+    conn: sqlite3.Connection,
+    *,
+    embedding_client=None,
+    embedding_model: Optional[str] = None,
+    expected_dimension: Optional[int] = None,
+    stats: Optional[dict] = None,
+) -> int:
+    """Embed active orphans through the caller-owned ``encode`` client.
+
+    The client is injected so sleep never constructs a model or selects a
+    device. Each node is dual-written under a savepoint; a loaded vec index
+    that rejects a write rolls back the ordinary row as well.
+    """
+    stats = stats if stats is not None else {}
+    stats.setdefault("orphan_write_failed", 0)
+    stats.setdefault("orphan_vec_unavailable", 0)
     rows = conn.execute(
         "SELECT tn.id, tn.content FROM thought_nodes tn "
         "LEFT JOIN embeddings e ON tn.id = e.node_id "
-        "WHERE e.node_id IS NULL "
-        "AND (tn.decayed IS NULL OR tn.decayed = 0) "
+        "WHERE e.node_id IS NULL AND (tn.decayed IS NULL OR tn.decayed = 0) "
         "AND tn.content IS NOT NULL AND TRIM(tn.content) != ''"
     ).fetchall()
-
-    if not rows:
+    vec_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vec_embeddings'"
+    ).fetchone() is not None
+    repair_rows = []
+    if vec_exists:
+        repair_rows = conn.execute(
+            "SELECT e.node_id, e.vector, COALESCE(e.model, '') "
+            "FROM embeddings e LEFT JOIN vec_embeddings v ON v.node_id=e.node_id "
+            "JOIN thought_nodes tn ON tn.id=e.node_id "
+            "WHERE v.node_id IS NULL AND (tn.decayed IS NULL OR tn.decayed=0)"
+        ).fetchall()
+    if not rows and not repair_rows:
         return 0
-
-    logger.info("sleep: embedding %d orphaned nodes…", len(rows))
-
-    from sentence_transformers import SentenceTransformer
-    from .config import get_embedding_model
-    # Use the CONFIGURED model, not the hardcoded default — otherwise, under a
-    # CASHEW_EMBEDDING_MODEL override, orphans get embedded at the wrong dim,
-    # get filtered out as wrong-dim every subsequent sleep cycle (re-embedded
-    # forever), and are unusable in search.
-    model_name = get_embedding_model()
-    model = SentenceTransformer(model_name)
-
-    embedded = 0
-    for nid, content in rows:
+    if rows and (embedding_client is None or not embedding_model or
+                 expected_dimension is None or int(expected_dimension) <= 0):
+        stats["capability_missing"] = True
+        return 0
+    expected = int(expected_dimension) if expected_dimension is not None else 0
+    vectors: List[np.ndarray] = []
+    if rows:
         try:
-            vec = model.encode(content, normalize_embeddings=True)
-            blob = vec.astype(np.float32).tobytes()
-
-            if not blob:
-                logger.warning(
-                    "sleep: skipping node %s — embedding produced empty bytes", nid[:8]
-                )
-                continue
-
-            try:
+            raw = embedding_client.encode([content for _, content in rows])
+            array = np.asarray(raw)
+            if array.shape != (len(rows), expected):
+                raise ValueError("embedding_shape_mismatch")
+            for item in array:
+                vec = np.asarray(item, dtype=np.float32)
+                if not np.all(np.isfinite(vec)) or np.allclose(vec, 0):
+                    raise ValueError("embedding_invalid")
+                vectors.append(vec)
+        except Exception as exc:
+            logger.warning(
+                "sleep: orphan embedding batch rejected: %s", type(exc).__name__
+            )
+            stats["orphan_write_failed"] += len(rows)
+            return 0
+    embedded = 0
+    def write_pair(nid: str, blob: bytes, model_name: str) -> None:
+        nonlocal embedded
+        savepoint = "orphan_" + re.sub(r"[^A-Za-z0-9_]", "_", nid)[:40]
+        try:
+            conn.execute(f"SAVEPOINT {savepoint}")
+            columns = {r[1] for r in conn.execute("PRAGMA table_info(embeddings)")}
+            if {"model", "updated_at"}.issubset(columns):
                 conn.execute(
                     "INSERT OR REPLACE INTO embeddings "
                     "(node_id, vector, model, updated_at) "
                     "VALUES (?, ?, ?, datetime('now'))",
                     (nid, blob, model_name),
                 )
-            except sqlite3.OperationalError:
+            else:
                 conn.execute(
                     "INSERT OR REPLACE INTO embeddings (node_id, vector) VALUES (?, ?)",
                     (nid, blob),
                 )
-            try:
+            if vec_exists:
                 conn.execute(
                     "INSERT OR REPLACE INTO vec_embeddings "
                     "(node_id, embedding) VALUES (?, ?)",
-                    (nid, blob),   # bytes, like embed_nodes — a Python list raises
-                )                  # ProgrammingError (not the OperationalError caught
-            except sqlite3.OperationalError:  # below), which left orphans with an
-                pass                          # embeddings row but no vec-index row.
-            embedded += 1
-        except Exception as e:
-            logger.warning("sleep: failed to embed node %s: %s", nid[:8], e)
-
+                    (nid, blob),
+                )
+                embedded += 1
+            else:
+                stats["orphan_vec_unavailable"] += 1
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        except Exception as exc:
+            try:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            except sqlite3.Error:
+                pass
+            stats["orphan_write_failed"] += 1
+            logger.warning(
+                "sleep: orphan %s dual-write failed: %s", nid[:8], type(exc).__name__
+            )
+    for (nid, _content), vec in zip(rows, vectors):
+        write_pair(nid, vec.tobytes(), str(embedding_model))
+    for nid, blob, stored_model in repair_rows:
+        vec = np.frombuffer(blob, dtype=np.float32)
+        repair_dim = (
+            int(expected_dimension)
+            if expected_dimension is not None else len(vec)
+        )
+        if len(vec) != repair_dim:
+            stats["orphan_write_failed"] += 1
+            continue
+        if not np.all(np.isfinite(vec)) or np.allclose(vec, 0):
+            stats["orphan_write_failed"] += 1
+            continue
+        write_pair(nid, bytes(blob), stored_model or str(embedding_model or ""))
     conn.commit()
-    logger.info("sleep: embedded %d orphaned nodes", embedded)
+    logger.info("sleep: embedded/repaired %d orphaned nodes", embedded)
     return embedded
 
 
@@ -876,6 +951,10 @@ def _run_dream_async(
     db_path: str,
     cross_link_tuples: List[Tuple[str, str, float]],
     model_fn,
+    embedding_client=None,
+    embedding_model: Optional[str] = None,
+    expected_dimension: Optional[int] = None,
+    journal_policy: str = "manage",
 ) -> None:
     """Run Phase 8 (dream) + Phase 9 (orphan embedding) in a daemon thread.
 
@@ -883,19 +962,26 @@ def _run_dream_async(
     the new session's sync worker writes.
     """
     def _task():
+        conn = None
         try:
             conn = sqlite3.connect(db_path)
             conn.execute("PRAGMA busy_timeout = 5000")
-            _set_wal(conn)
+            if journal_policy == "manage":
+                _set_wal(conn)
             dream_id = _generate_dream(conn, cross_link_tuples, model_fn=model_fn)
-            orphans = _embed_orphans(conn)
-            conn.close()
+            orphans = _embed_orphans(
+                conn, embedding_client=embedding_client,
+                embedding_model=embedding_model, expected_dimension=expected_dimension,
+            )
             logger.info(
                 "sleep: background dream complete (id=%s, orphans=%d)",
                 dream_id or "none", orphans,
             )
         except Exception:
             logger.warning("sleep: background dream failed", exc_info=True)
+        finally:
+            if conn is not None:
+                conn.close()
 
     t = threading.Thread(target=_task, daemon=True)
     t.start()
@@ -905,13 +991,39 @@ def _run_dream_async(
 # ── main entry point (free function) ─────────────────────────────────────
 
 
+def _empty_sleep_result(
+    status: str, error: Optional[str], elapsed_s: float = 0.0
+) -> dict:
+    """Return the stable JSON shape for preflight/capability outcomes."""
+    result = {
+        "status": status, "error": error,
+        "nodes_selected": 0, "nodes_with_embeddings": 0, "total_nodes": 0,
+        "cross_link_candidates": 0, "cross_links_created": 0,
+        "cross_links_repaired": 0, "cross_links_skipped": 0,
+        "cross_link_directed_rows": 0, "cross_link_capped": False,
+        "cross_link_same_source_skipped": 0, "dedup_candidates": 0,
+        "dedup_components": 0, "dedup_nodes_merged": 0,
+        "nodes_gc_decayed": 0, "nodes_made_permanent": 0,
+        "core_promoted": 0, "core_demoted": 0, "orphans_embedded": 0,
+        "orphan_write_failed": 0, "orphan_vec_unavailable": 0,
+        "vec_rows_compacted": 0, "dream_id": None, "dream_pending": False,
+        "dream_generation": "skipped", "elapsed_s": max(0.0, float(elapsed_s)),
+    }
+    return result
+
+
 def run_sleep_cycle(
-    db_path: str = None,
+    db_path: Optional[str] = None,
     limit: Optional[int] = None,
     model_fn=None,
+    *,
     background_dream: bool = False,
     max_edges: int = MAX_EDGES_PER_CYCLE,
     cross_source_only: bool = False,
+    embedding_client=None,
+    embedding_model: Optional[str] = None,
+    expected_dimension: Optional[int] = None,
+    journal_policy: str = "manage",
 ) -> dict:
     """Run one complete refactored sleep cycle.
 
@@ -948,9 +1060,23 @@ def run_sleep_cycle(
         db_path = get_db_path()
 
     t_start = time.perf_counter()
+    if journal_policy not in {"manage", "preserve"}:
+        return _empty_sleep_result("rejected", "invalid_journal_policy")
+    if limit is not None and (not isinstance(limit, int) or limit < 0):
+        return _empty_sleep_result("rejected", "invalid_limit")
+    if not isinstance(max_edges, int) or max_edges < 0:
+        return _empty_sleep_result("rejected", "invalid_max_edges")
+    profile = None
+    if embedding_model:
+        try:
+            profile = _get_active_profile(embedding_model)
+        except Exception:
+            return _empty_sleep_result("rejected", "uncalibrated_embedding_model")
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA busy_timeout = 5000")
-    _set_wal(conn)
+    if journal_policy == "manage":
+        _set_wal(conn)
+    ensure_decay_audit_schema(conn)
 
     # Check if embeddings table exists — required for vectorized pipeline
     table_check = conn.execute(
@@ -958,8 +1084,10 @@ def run_sleep_cycle(
     ).fetchone()
     if not table_check:
         logger.warning("sleep: no embeddings table — aborting (run cashew init first)")
+        conn.commit()
         conn.close()
-        return {"error": "no embeddings table", "nodes_selected": 0}
+        return _empty_sleep_result("unavailable", "no_embeddings_table",
+                                   time.perf_counter() - t_start)
 
     # ── Select nodes for this cycle (oldest-first) ──
     if limit is None:
@@ -982,14 +1110,22 @@ def run_sleep_cycle(
     ids = [r[0] for r in rows]
     logger.info("sleep: selected %d nodes (limit=%s)", len(ids), limit)
 
-    valid_ids, matrix = _load_embedding_matrix(conn, ids)
+    valid_ids, matrix = _load_embedding_matrix(conn, ids, expected_dimension)
     if len(valid_ids) < 2:
         logger.warning("sleep: too few valid embeddings — aborting")
         conn.close()
-        return {"error": "too few nodes", "nodes_selected": len(ids)}
+        result = _empty_sleep_result("unavailable", "too_few_embeddings",
+                                     time.perf_counter() - t_start)
+        result["nodes_selected"] = len(ids)
+        result["nodes_with_embeddings"] = len(valid_ids)
+        return result
 
     # Phase 1: candidate discovery
-    cross_pairs, dedup_pairs, sim = _find_pairs(valid_ids, matrix)
+    cross_pairs, dedup_pairs, sim = _find_pairs(
+        valid_ids, matrix,
+        cross_threshold=profile.cross_link_threshold if profile else None,
+        dedup_threshold=profile.dedup_threshold if profile else None,
+    )
 
     # Build source_file map for cross-source filtering
     source_files: Optional[Dict[str, str]] = None
@@ -1056,6 +1192,8 @@ def run_sleep_cycle(
                 db_path=db_path,
                 cross_link_tuples=cross_link_tuples,
                 model_fn=model_fn,
+                embedding_client=embedding_client, embedding_model=embedding_model,
+                expected_dimension=expected_dimension, journal_policy=journal_policy,
             )
             dream_pending = True
         else:
@@ -1065,8 +1203,14 @@ def run_sleep_cycle(
     if background_dream:
         orphans = 0  # handled by background dream thread
     else:
-        orphans = _embed_orphans(conn)
+        orphan_stats: dict = {}
+        orphans = _embed_orphans(
+            conn, embedding_client=embedding_client, embedding_model=embedding_model,
+            expected_dimension=expected_dimension, stats=orphan_stats,
+        )
 
+    if background_dream:
+        orphan_stats = {}
     conn.close()
     elapsed = round(time.perf_counter() - t_start, 1)
 
@@ -1074,6 +1218,9 @@ def run_sleep_cycle(
     try:
         audit_conn = sqlite3.connect(db_path)
         audit_conn.execute("PRAGMA busy_timeout = 5000")
+        if journal_policy == "manage":
+            _set_wal(audit_conn)
+        ensure_decay_audit_schema(audit_conn)
         audit_pruned = gc_decay_audit(audit_conn, retention_days=7)
         audit_conn.commit()
         audit_conn.close()
@@ -1094,13 +1241,36 @@ def run_sleep_cycle(
     except Exception as e:
         logger.warning("sleep: vec-index compaction failed: %s", e)
 
+    dream_generation = (
+        "pending" if dream_pending else ("ran" if dream_id else "skipped")
+    )
+    if (model_fn is not None and cross_link_tuples and not background_dream
+            and dream_id is None):
+        dream_generation = "failed"
+    phase_committed = bool(
+        cross_stats.get("created", 0) or cross_stats.get("repaired", 0)
+        or dedup_stats.get("nodes_merged", 0) or gc_count
+        or perm_stats.get("nodes_promoted", 0) or core_stats.get("promoted", 0)
+    )
+    if orphan_stats.get("capability_missing"):
+        result_status = "partial" if phase_committed else "unavailable"
+        result_error = "embedding_capability_unavailable"
+    elif orphan_stats.get("orphan_write_failed"):
+        result_status = "partial" if phase_committed else "failed"
+        result_error = "orphan_write_failed"
+    else:
+        result_status, result_error = "completed", None
     summary = {
+        "status": result_status,
+        "error": result_error,
         "nodes_selected": len(ids),
         "nodes_with_embeddings": len(valid_ids),
         "cross_link_candidates": len(cross_pairs),
         "dedup_candidates": len(dedup_pairs),
         "cross_links_created": cross_stats["created"],
+        "cross_links_repaired": cross_stats.get("repaired", 0),
         "cross_links_skipped": cross_stats["skipped"],
+        "cross_link_directed_rows": cross_stats.get("directed_rows", 0),
         "cross_link_same_source_skipped": cross_stats.get("same_source_skipped", 0),
         "cross_link_capped": cross_stats.get("capped", False),
         "dedup_components": dedup_stats["components"],
@@ -1112,7 +1282,10 @@ def run_sleep_cycle(
         "core_demoted": core_stats.get("demoted", 0),
         "dream_id": dream_id,
         "dream_pending": dream_pending,
+        "dream_generation": dream_generation,
         "orphans_embedded": orphans,
+        "orphan_write_failed": orphan_stats.get("orphan_write_failed", 0),
+        "orphan_vec_unavailable": orphan_stats.get("orphan_vec_unavailable", 0),
         "total_nodes": len(metrics),
         "elapsed_s": elapsed,
     }
@@ -1137,6 +1310,9 @@ def run_sleep_cycle(
             "1" if dream_id else "0", orphans,
         )
 
+    if dream_generation == "failed" and summary["status"] == "completed":
+        summary["status"] = "partial"
+        summary["error"] = "dream_failed"
     return summary
 
 
@@ -1175,7 +1351,9 @@ class SleepProtocol:
     ``run_sleep_cycle()`` delegates to the vectorized pipeline above.
     """
 
-    def __init__(self, db_path: str = None, sleep_log_path: str = None):
+    def __init__(
+        self, db_path: Optional[str] = None, sleep_log_path: Optional[str] = None
+    ):
         if db_path is None:
             db_path = get_db_path()
         if sleep_log_path is None:
@@ -1227,6 +1405,10 @@ class SleepProtocol:
             background_dream=kwargs.get("background_dream", False),
             max_edges=kwargs.get("max_edges", MAX_EDGES_PER_CYCLE),
             cross_source_only=kwargs.get("cross_source_only", False),
+            embedding_client=kwargs.get("embedding_client"),
+            embedding_model=kwargs.get("embedding_model"),
+            expected_dimension=kwargs.get("expected_dimension"),
+            journal_policy=kwargs.get("journal_policy", "manage"),
         )
 
         # Map vectorized result back to old-style summary keys for compat
