@@ -112,11 +112,12 @@ def test_cross_link_cap_batches_at_five_hundred_pairs(tmp_path, pair_count):
     pairs = np.asarray([[2 * i, 2 * i + 1] for i in range(pair_count)])
     sim = np.eye(len(ids), dtype=np.float32)
     conn = _edge_db(tmp_path, name=f"edges-{pair_count}.db", factory=_CountingConnection)
+    baseline_commit_count = conn.commit_count
     stats = _batch_cross_links(conn, ids, pairs, sim, max_edges=pair_count)
     assert stats["created"] == pair_count
     assert stats["directed_rows"] == pair_count * 2
     assert conn.execute("SELECT count(*) FROM derivation_edges").fetchone()[0] == pair_count * 2
-    assert conn.commit_count <= 2
+    assert conn.commit_count - baseline_commit_count <= 2
     conn.close()
 
 
