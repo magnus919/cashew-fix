@@ -11,7 +11,7 @@ import pytest
 
 from core.decay_audit import ensure_decay_audit_schema
 import core.sleep as sleep_module
-from core.sleep import _batch_cross_links, _embed_orphans, run_sleep_cycle
+from core.sleep import _batch_cross_links, _embed_orphans, _vec_write_capability, run_sleep_cycle
 
 
 class _CountingConnection(sqlite3.Connection):
@@ -40,7 +40,7 @@ def _cycle_db(tmp_path: Path, name: str = "cycle.db") -> Path:
             id TEXT PRIMARY KEY, content TEXT, decayed INTEGER DEFAULT 0,
             timestamp TEXT DEFAULT '', source_file TEXT, access_count INTEGER DEFAULT 0,
             permanent INTEGER DEFAULT 0, last_accessed TEXT, domain TEXT, node_type TEXT,
-            confidence REAL, metadata TEXT
+            confidence REAL, metadata TEXT, mood_state TEXT
         );
         CREATE TABLE embeddings(
             node_id TEXT PRIMARY KEY, vector BLOB, model TEXT, updated_at TEXT
@@ -147,6 +147,14 @@ def test_embedding_profile_dimension_is_rejected_before_database_open(monkeypatc
     assert result["error"] == "embedding_dimension_mismatch"
 
 
+def test_active_profile_failure_without_explicit_model_is_pre_db(monkeypatch):
+    monkeypatch.setattr(sleep_module, "_get_active_profile", lambda *_args: (_ for _ in ()).throw(RuntimeError("profile")))
+    monkeypatch.setattr(sqlite3, "connect", lambda *_args, **_kwargs: pytest.fail("database must not open"))
+    result = run_sleep_cycle(db_path="/tmp/does-not-exist.db")
+    assert result["status"] in {"rejected", "unavailable"}
+    assert result["error"] == "uncalibrated_embedding_model"
+
+
 class _Client:
     def __init__(self, value):
         self.value = value
@@ -162,11 +170,18 @@ def _orphan_db(tmp_path: Path, vec: bool = True):
     conn.execute(
         "CREATE TABLE thought_nodes("
         "id TEXT PRIMARY KEY, content TEXT, decayed INTEGER DEFAULT 0, "
-        "timestamp TEXT DEFAULT '')"
+        "timestamp TEXT DEFAULT '', source_file TEXT, access_count INTEGER DEFAULT 0, "
+        "permanent INTEGER DEFAULT 0, node_type TEXT DEFAULT 'observation', "
+        "last_accessed TEXT, domain TEXT)"
     )
     conn.execute(
         "CREATE TABLE embeddings("
         "node_id TEXT PRIMARY KEY, vector BLOB, model TEXT, updated_at TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE derivation_edges("
+        "parent_id TEXT, child_id TEXT, weight REAL, reasoning TEXT, "
+        "PRIMARY KEY(parent_id, child_id))"
     )
     if vec:
         conn.execute(
@@ -285,6 +300,49 @@ def test_real_sqlite_vec0_dual_write_when_extension_is_available(tmp_path):
     )
     conn.commit()
     conn.close()
+
+
+def _real_vec_db(tmp_path: Path, name: str):
+    pytest.importorskip("sqlite_vec")
+    from core.embeddings import _load_vec
+    conn = _orphan_db(tmp_path)
+    conn.execute("DROP TABLE vec_embeddings")
+    _load_vec(conn)
+    conn.execute(
+        "CREATE VIRTUAL TABLE vec_embeddings USING vec0("
+        "node_id text primary key, embedding float[4] distance_metric=cosine)"
+    )
+    conn.commit()
+    conn.close()
+    return sqlite3.connect(str(tmp_path / "orphans.db"))
+
+
+def test_vec_enable_failure_is_unavailable(tmp_path):
+    conn = _real_vec_db(tmp_path, "enable-failure")
+
+    class Disabled(sqlite3.Connection):
+        def enable_load_extension(self, _enabled):
+            raise sqlite3.OperationalError("extension disabled")
+
+    conn.close()
+    disabled = sqlite3.connect(str(tmp_path / "orphans.db"), factory=Disabled)
+    assert _vec_write_capability(disabled) is False
+    disabled.close()
+
+
+def test_vec_post_load_query_failure_is_hard(tmp_path):
+    _real_vec_db(tmp_path, "query-failure").close()
+
+    class BrokenQuery(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            if sql == "SELECT count(*) FROM vec_embeddings":
+                raise sqlite3.OperationalError("corrupt vec schema")
+            return super().execute(sql, *args, **kwargs)
+
+    conn = sqlite3.connect(str(tmp_path / "orphans.db"), factory=BrokenQuery)
+    with pytest.raises(sqlite3.OperationalError, match="corrupt vec schema"):
+        _vec_write_capability(conn)
+    conn.close()
     conn = sqlite3.connect(str(tmp_path / "orphans.db"))
     client = _Client(lambda n: np.ones((n, 4), dtype=np.float32))
     assert (
@@ -335,20 +393,63 @@ def test_public_cycle_exposes_cross_link_failure(tmp_path, monkeypatch):
     assert result["error"] == "cross_link_failed"
 
 
-def test_synchronous_dream_reports_ran(tmp_path, monkeypatch):
-    path = _cycle_db(tmp_path, "dream.db")
+def test_zero_prefix_dream_failure_is_failed(tmp_path, monkeypatch):
+    path = _cycle_db(tmp_path, "zero-dream.db")
+    conn = sqlite3.connect(str(path))
+    conn.execute("UPDATE thought_nodes SET source_file='one.md' WHERE id='a'")
+    conn.execute("UPDATE thought_nodes SET source_file='two.md' WHERE id='b'")
+    conn.commit()
+    conn.close()
     monkeypatch.setattr(
         sleep_module, "_find_pairs",
         lambda *_args, **_kwargs: (
             np.asarray([[0, 1]]), np.empty((0, 2), dtype=int), np.eye(2)
         ),
     )
-    monkeypatch.setattr(sleep_module, "_generate_dream", lambda *_args, **_kwargs: "dream-id")
+    monkeypatch.setattr(
+        sleep_module, "_batch_cross_links",
+        lambda *_args, **_kwargs: {"created": 0, "repaired": 0, "skipped": 0,
+                                   "failed": 0, "directed_rows": 0},
+    )
+    monkeypatch.setattr(sleep_module, "_evaluate_permanence", lambda *_args: {"nodes_promoted": 0})
+    monkeypatch.setattr(sleep_module, "_promote_core_memories", lambda *_args: {"promoted": 0, "demoted": 0})
     result = run_sleep_cycle(
-        db_path=str(path), model_fn=lambda _prompt: "unused", journal_policy="preserve"
+        db_path=str(path), model_fn=lambda _prompt: "too short", journal_policy="preserve"
+    )
+    assert result["dream_generation"] == "failed"
+    assert result["status"] == "failed"
+    assert result["error"] == "dream_failed"
+
+
+def test_synchronous_dream_reports_ran(tmp_path, monkeypatch):
+    path = _cycle_db(tmp_path, "dream.db")
+    conn = sqlite3.connect(str(path))
+    v1 = np.zeros(1024, dtype=np.float32)
+    v1[0] = 1.0
+    v2 = np.zeros(1024, dtype=np.float32)
+    v2[0] = 0.92
+    v2[1] = np.sqrt(1.0 - 0.92 ** 2)
+    conn.execute("UPDATE thought_nodes SET source_file='one.md' WHERE id='a'")
+    conn.execute("UPDATE thought_nodes SET source_file='two.md' WHERE id='b'")
+    conn.execute("UPDATE embeddings SET vector=? WHERE node_id='a'", (v1.tobytes(),))
+    conn.execute("UPDATE embeddings SET vector=? WHERE node_id='b'", (v2.tobytes(),))
+    conn.commit()
+    conn.close()
+    result = run_sleep_cycle(
+        db_path=str(path),
+        model_fn=lambda _prompt: "A durable relationship connects these two observations.",
+        journal_policy="preserve",
     )
     assert result["dream_generation"] == "ran"
-    assert result["status"] != "failed"
+    assert result["dream_id"]
+    check = sqlite3.connect(str(path))
+    assert check.execute(
+        "SELECT count(*) FROM thought_nodes WHERE id=?", (result["dream_id"],)
+    ).fetchone()[0] == 1
+    assert check.execute(
+        "SELECT count(*) FROM derivation_edges WHERE child_id=?", (result["dream_id"],)
+    ).fetchone()[0] == 2
+    check.close()
 
 
 def test_public_cycle_repairs_orphan_before_anchor_requirement(tmp_path):
@@ -364,6 +465,7 @@ def test_public_cycle_repairs_orphan_before_anchor_requirement(tmp_path):
         "INSERT INTO thought_nodes (id, content, decayed) VALUES ('anchor','anchor',0)"
     )
     conn.commit()
+    conn.close()
     client = _Client(lambda n: np.ones((n, dimension), dtype=np.float32))
     result = run_sleep_cycle(
         db_path=str(tmp_path / "orphans.db"),
@@ -374,8 +476,29 @@ def test_public_cycle_repairs_orphan_before_anchor_requirement(tmp_path):
     )
     assert client.calls == [["orphan"]]
     assert result["orphans_embedded"] == 2
-    assert conn.execute("SELECT count(*) FROM vec_embeddings").fetchone()[0] == 2
+    assert result["nodes_selected"] == 2
+    assert result["dedup_nodes_merged"] == 1
+    check = sqlite3.connect(str(tmp_path / "orphans.db"))
+    assert check.execute("SELECT count(*) FROM vec_embeddings").fetchone()[0] == 1
+    check.close()
+
+
+def test_public_cycle_reports_ordinary_only_orphan_write(tmp_path):
+    conn = _orphan_db(tmp_path, vec=False)
     conn.close()
+    client = _Client(lambda n: np.ones((n, 384), dtype=np.float32))
+    result = run_sleep_cycle(
+        db_path=str(tmp_path / "orphans.db"),
+        embedding_client=client,
+        embedding_model="all-MiniLM-L6-v2",
+        expected_dimension=384,
+        journal_policy="preserve",
+    )
+    assert result["orphan_ordinary_written"] == 1
+    assert result["orphan_vec_unavailable"] == 1
+    check = sqlite3.connect(str(tmp_path / "orphans.db"))
+    assert check.execute("SELECT count(*) FROM embeddings").fetchone()[0] == 1
+    check.close()
 
 
 def test_decay_audit_schema_is_idempotent_and_preserves_graph(tmp_path):

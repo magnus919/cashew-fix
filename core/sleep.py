@@ -846,17 +846,14 @@ def _vec_write_capability(conn: sqlite3.Connection) -> bool:
     except ImportError:
         return False
     try:
-        conn.enable_load_extension(True)
         try:
+            conn.enable_load_extension(True)
             sqlite_vec.load(conn)
-        except (OSError, sqlite3.OperationalError) as exc:
-            # Only failure to load the optional extension is ordinary-only
-            # degradation. Once loaded, schema/query failures are real errors.
-            text = str(exc).lower()
-            if any(token in text for token in
-                   ("not authorized", "cannot load", "no such module", "unable to load")):
-                return False
-            raise
+        except (OSError, sqlite3.Error):
+            # Enable/load failure is the only ordinary-only capability loss.
+            # Errors after this point prove that the extension loaded and must
+            # remain visible as a hard dual-write/schema failure.
+            return False
         conn.execute("SELECT count(*) FROM vec_embeddings").fetchone()
         return True
     finally:
@@ -883,6 +880,7 @@ def _embed_orphans(
     stats = stats if stats is not None else {}
     stats.setdefault("orphan_write_failed", 0)
     stats.setdefault("orphan_vec_unavailable", 0)
+    stats.setdefault("orphan_ordinary_written", 0)
     rows = conn.execute(
         "SELECT tn.id, tn.content FROM thought_nodes tn "
         "LEFT JOIN embeddings e ON tn.id = e.node_id "
@@ -944,6 +942,7 @@ def _embed_orphans(
                     "INSERT OR REPLACE INTO embeddings (node_id, vector) VALUES (?, ?)",
                     (nid, blob),
                 )
+            stats["orphan_ordinary_written"] += 1
             if vec_available:
                 conn.execute(
                     "INSERT OR REPLACE INTO vec_embeddings "
@@ -1048,6 +1047,7 @@ def _empty_sleep_result(
         "dedup_components": 0, "dedup_nodes_merged": 0,
         "nodes_gc_decayed": 0, "nodes_made_permanent": 0,
         "core_promoted": 0, "core_demoted": 0, "orphans_embedded": 0,
+        "orphan_ordinary_written": 0,
         "orphan_write_failed": 0, "orphan_vec_unavailable": 0,
         "vec_rows_compacted": 0, "dream_id": None, "dream_pending": False,
         "dream_generation": "skipped", "elapsed_s": max(0.0, float(elapsed_s)),
@@ -1130,7 +1130,7 @@ def run_sleep_cycle(
         except Exception:
             if embedding_model:
                 return _empty_sleep_result("rejected", "uncalibrated_embedding_model")
-            profile = None
+            return _empty_sleep_result("unavailable", "uncalibrated_embedding_model")
         if all(supplied_embedding) and profile is not None:
             if profile.dim != expected_dimension:
                 return _empty_sleep_result("rejected", "embedding_dimension_mismatch")
@@ -1173,9 +1173,10 @@ def run_sleep_cycle(
         logger.info("sleep: selected %d nodes (limit=%s)", len(ids), limit)
 
         valid_ids, matrix = _load_embedding_matrix(conn, ids, expected_dimension)
+        orphan_stats: dict = {}
+        orphans = 0
         if len(valid_ids) < 2:
             logger.warning("sleep: too few valid embeddings — aborting")
-            orphan_stats: dict = {}
             orphans = _embed_orphans(
                 conn,
                 embedding_client=embedding_client,
@@ -1183,17 +1184,29 @@ def run_sleep_cycle(
                 expected_dimension=expected_dimension,
                 stats=orphan_stats,
             )
-            conn.close()
-            result = _empty_sleep_result("unavailable", "too_few_embeddings",
-                                         time.perf_counter() - t_start)
-            result["nodes_selected"] = len(ids)
-            result["nodes_with_embeddings"] = len(valid_ids)
-            result["orphans_embedded"] = orphans
-            result["orphan_write_failed"] = orphan_stats.get("orphan_write_failed", 0)
-            result["orphan_vec_unavailable"] = orphan_stats.get(
-                "orphan_vec_unavailable", 0
-            )
-            return result
+            rows = conn.execute(
+                "SELECT e.node_id FROM embeddings e "
+                "JOIN thought_nodes tn ON e.node_id = tn.id "
+                "WHERE (tn.decayed IS NULL OR tn.decayed = 0) "
+                "ORDER BY tn.timestamp ASC"
+            ).fetchall()
+            ids = [r[0] for r in rows]
+            valid_ids, matrix = _load_embedding_matrix(conn, ids, expected_dimension)
+            if len(valid_ids) < 2:
+                conn.close()
+                result = _empty_sleep_result("unavailable", "too_few_embeddings",
+                                             time.perf_counter() - t_start)
+                result["nodes_selected"] = len(ids)
+                result["nodes_with_embeddings"] = len(valid_ids)
+                result["orphans_embedded"] = orphans
+                result["orphan_ordinary_written"] = orphan_stats.get(
+                    "orphan_ordinary_written", 0
+                )
+                result["orphan_write_failed"] = orphan_stats.get("orphan_write_failed", 0)
+                result["orphan_vec_unavailable"] = orphan_stats.get(
+                    "orphan_vec_unavailable", 0
+                )
+                return result
 
         # Phase 1: candidate discovery
         cross_pairs, dedup_pairs, sim = _find_pairs(
@@ -1297,16 +1310,29 @@ def run_sleep_cycle(
                 dream_pending = True
             else:
                 dream_id = _generate_dream(conn, cross_link_tuples, model_fn=model_fn)
+        progress["dream_id"] = dream_id
 
         # Phase 9: embed orphans
         if background_dream:
             orphans = 0  # handled by background dream thread
         else:
-            orphan_stats = {}
-            orphans = _embed_orphans(
+            later_orphan_stats: dict = {}
+            later_orphans = _embed_orphans(
                 conn, embedding_client=embedding_client, embedding_model=embedding_model,
-                expected_dimension=expected_dimension, stats=orphan_stats,
+                expected_dimension=expected_dimension, stats=later_orphan_stats,
             )
+            orphans += later_orphans
+            for key in ("orphan_write_failed", "orphan_vec_unavailable",
+                        "orphan_ordinary_written"):
+                orphan_stats[key] = orphan_stats.get(key, 0) + later_orphan_stats.get(key, 0)
+            orphan_stats["capability_missing"] = (
+                orphan_stats.get("capability_missing", False)
+                or later_orphan_stats.get("capability_missing", False)
+            )
+        progress["orphans_embedded"] = orphans
+        progress["orphan_ordinary_written"] = orphan_stats.get(
+            "orphan_ordinary_written", 0
+        )
 
         if background_dream:
             orphan_stats = {}
@@ -1353,6 +1379,9 @@ def run_sleep_cycle(
             cross_stats.get("created", 0) or cross_stats.get("repaired", 0)
             or dedup_stats.get("nodes_merged", 0) or gc_count
             or perm_stats.get("nodes_promoted", 0) or core_stats.get("promoted", 0)
+            or core_stats.get("demoted", 0)
+            or orphan_stats.get("orphan_ordinary_written", 0)
+            or dream_id
         )
         if cross_stats.get("failed"):
             result_status = "partial" if phase_committed else "failed"
@@ -1392,6 +1421,7 @@ def run_sleep_cycle(
             "dream_pending": dream_pending,
             "dream_generation": dream_generation,
             "orphans_embedded": orphans,
+            "orphan_ordinary_written": orphan_stats.get("orphan_ordinary_written", 0),
             "orphan_write_failed": orphan_stats.get("orphan_write_failed", 0),
             "orphan_vec_unavailable": orphan_stats.get("orphan_vec_unavailable", 0),
             "total_nodes": len(metrics),
@@ -1419,7 +1449,7 @@ def run_sleep_cycle(
             )
 
         if dream_generation == "failed" and summary["status"] == "completed":
-            summary["status"] = "partial"
+            summary["status"] = "partial" if phase_committed else "failed"
             summary["error"] = "dream_failed"
         return summary
 
@@ -1429,7 +1459,11 @@ def run_sleep_cycle(
             "cross_links_repaired", 0
         ) + progress.get("dedup_nodes_merged", 0) + progress.get(
             "nodes_gc_decayed", 0
-        )
+        ) + progress.get("nodes_made_permanent", 0) + progress.get(
+            "core_promoted", 0
+        ) + progress.get("core_demoted", 0) + progress.get(
+            "orphan_ordinary_written", 0
+        ) + bool(progress.get("dream_id"))
         if persisted:
             progress["status"] = "partial"
             progress["error"] = "sleep_cycle_failed"
