@@ -11,7 +11,10 @@ import pytest
 
 from core.decay_audit import ensure_decay_audit_schema
 import core.sleep as sleep_module
-from core.sleep import _batch_cross_links, _embed_orphans, _vec_write_capability, run_sleep_cycle
+from core.sleep import (
+    _batch_cross_links, _embed_orphans, _empty_sleep_result,
+    _vec_write_capability, run_sleep_cycle,
+)
 
 
 class _CountingConnection(sqlite3.Connection):
@@ -399,6 +402,7 @@ def test_early_orphan_commit_survives_candidate_discovery_failure(tmp_path, monk
     assert result["status"] == "partial"
     assert result["error"] == "sleep_cycle_failed"
     assert result["orphans_embedded"] == 2
+    assert set(result) == set(_empty_sleep_result("partial", "sleep_cycle_failed"))
     check = sqlite3.connect(str(tmp_path / "orphans.db"))
     assert check.execute("SELECT count(*) FROM embeddings").fetchone()[0] == 2
     check.close()

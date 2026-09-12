@@ -1057,6 +1057,15 @@ def _empty_sleep_result(
     return result
 
 
+def _public_sleep_result(result: dict) -> dict:
+    """Project internal phase bookkeeping onto the stable public schema."""
+    public = _empty_sleep_result(
+        result.get("status", "failed"), result.get("error"), result.get("elapsed_s", 0.0)
+    )
+    public.update({key: value for key, value in result.items() if key in public})
+    return public
+
+
 def run_sleep_cycle(
     db_path: Optional[str] = None,
     limit: Optional[int] = None,
@@ -1490,7 +1499,7 @@ def run_sleep_cycle(
             progress["status"] = "partial"
             progress["error"] = "sleep_cycle_failed"
             progress["elapsed_s"] = round(time.perf_counter() - t_start, 1)
-            return progress
+            return _public_sleep_result(progress)
         return _empty_sleep_result("failed", "sleep_cycle_failed",
                                    time.perf_counter() - t_start)
     finally:
