@@ -1380,6 +1380,7 @@ def run_sleep_cycle(
             or dedup_stats.get("nodes_merged", 0) or gc_count
             or perm_stats.get("nodes_promoted", 0) or core_stats.get("promoted", 0)
             or core_stats.get("demoted", 0)
+            or orphans
             or orphan_stats.get("orphan_ordinary_written", 0)
             or dream_id
         )
@@ -1463,7 +1464,7 @@ def run_sleep_cycle(
             "core_promoted", 0
         ) + progress.get("core_demoted", 0) + progress.get(
             "orphan_ordinary_written", 0
-        ) + bool(progress.get("dream_id"))
+        ) + progress.get("orphans_embedded", 0) + bool(progress.get("dream_id"))
         if persisted:
             progress["status"] = "partial"
             progress["error"] = "sleep_cycle_failed"

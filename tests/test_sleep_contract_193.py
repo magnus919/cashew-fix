@@ -375,6 +375,71 @@ def test_public_cycle_reports_committed_prefix_when_later_phase_fails(tmp_path, 
     check.close()
 
 
+def _force_late_dream_failure(monkeypatch):
+    monkeypatch.setattr(
+        sleep_module, "_find_pairs",
+        lambda *_args, **_kwargs: (
+            np.asarray([[0, 1]]), np.empty((0, 2), dtype=int), np.eye(2)
+        ),
+    )
+    monkeypatch.setattr(
+        sleep_module, "_generate_dream",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("late")),
+    )
+
+
+def test_late_failure_preserves_permanence_promotion(tmp_path, monkeypatch):
+    path = _cycle_db(tmp_path, "permanence-late.db")
+
+    def promote(conn, **_kwargs):
+        conn.execute("UPDATE thought_nodes SET permanent=1 WHERE id='a'")
+        conn.commit()
+        return {"nodes_promoted": 1}
+
+    monkeypatch.setattr(sleep_module, "_evaluate_permanence", promote)
+    monkeypatch.setattr(sleep_module, "_promote_core_memories", lambda *_args: {"promoted": 0, "demoted": 0})
+    _force_late_dream_failure(monkeypatch)
+    result = run_sleep_cycle(db_path=str(path), model_fn=lambda _prompt: "unused", journal_policy="preserve")
+    assert result["status"] == "partial"
+    assert result["nodes_made_permanent"] == 1
+
+
+def test_late_failure_preserves_core_promotion(tmp_path, monkeypatch):
+    path = _cycle_db(tmp_path, "core-promotion-late.db")
+
+    def promote_core(conn, _metrics):
+        conn.execute("UPDATE thought_nodes SET node_type='core_memory' WHERE id='a'")
+        conn.commit()
+        return {"promoted": 1, "demoted": 0}
+
+    monkeypatch.setattr(sleep_module, "_evaluate_permanence", lambda *_args: {"nodes_promoted": 0})
+    monkeypatch.setattr(sleep_module, "_promote_core_memories", promote_core)
+    _force_late_dream_failure(monkeypatch)
+    result = run_sleep_cycle(db_path=str(path), model_fn=lambda _prompt: "unused", journal_policy="preserve")
+    assert result["status"] == "partial"
+    assert result["core_promoted"] == 1
+
+
+def test_late_failure_preserves_core_demotion(tmp_path, monkeypatch):
+    path = _cycle_db(tmp_path, "core-demotion-late.db")
+    conn = sqlite3.connect(str(path))
+    conn.execute("UPDATE thought_nodes SET node_type='core_memory' WHERE id='a'")
+    conn.commit()
+    conn.close()
+
+    def demote_core(conn, _metrics):
+        conn.execute("UPDATE thought_nodes SET node_type='derived' WHERE id='a'")
+        conn.commit()
+        return {"promoted": 0, "demoted": 1}
+
+    monkeypatch.setattr(sleep_module, "_evaluate_permanence", lambda *_args: {"nodes_promoted": 0})
+    monkeypatch.setattr(sleep_module, "_promote_core_memories", demote_core)
+    _force_late_dream_failure(monkeypatch)
+    result = run_sleep_cycle(db_path=str(path), model_fn=lambda _prompt: "unused", journal_policy="preserve")
+    assert result["status"] == "partial"
+    assert result["core_demoted"] == 1
+
+
 def test_public_cycle_exposes_cross_link_failure(tmp_path, monkeypatch):
     path = _cycle_db(tmp_path)
     monkeypatch.setattr(
