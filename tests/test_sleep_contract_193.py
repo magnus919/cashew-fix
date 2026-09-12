@@ -214,7 +214,8 @@ def test_public_cycle_repairs_orphan_before_anchor_requirement(tmp_path):
     conn = _orphan_db(tmp_path)
     anchor = np.ones(4, dtype=np.float32).tobytes()
     conn.execute(
-        "INSERT INTO embeddings VALUES ('anchor', ?, 'm', datetime('now'))", (anchor,)
+        "INSERT INTO embeddings VALUES ('anchor', ?, 'all-MiniLM-L6-v2', datetime('now'))",
+        (anchor,),
     )
     conn.execute(
         "INSERT INTO thought_nodes (id, content, decayed) VALUES ('anchor','anchor',0)"

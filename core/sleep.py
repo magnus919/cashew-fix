@@ -946,6 +946,9 @@ def _embed_orphans(
         write_pair(nid, vec.tobytes(), str(embedding_model))
     for nid, blob, stored_model in repair_rows:
         vec = np.frombuffer(blob, dtype=np.float32)
+        if embedding_model and stored_model and stored_model != embedding_model:
+            stats["orphan_write_failed"] += 1
+            continue
         repair_dim = (
             int(expected_dimension)
             if expected_dimension is not None else len(vec)
