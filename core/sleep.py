@@ -53,6 +53,7 @@ DEDUP_THRESHOLD       = _profile.dedup_threshold       # cosine ≥ this → ded
 MAX_NODES_PER_CYCLE   = 2000   # work cap: process at most N oldest nodes
 MAX_EDGES_PER_CYCLE   = 100_000  # hard cap on cross-links per cycle
 EDGES_PER_BATCH       = 500    # commit watermark for batched inserts
+ORPHANS_PER_BATCH     = 100    # conservative caller-facing encode batch
 GC_K_NODES            = 50     # random sample size for garbage collection
 GC_THRESHOLD          = 0.0    # fitness below this → collectable (config overrides)
 GC_ACCESS_FLOOR       = 3      # nodes retrieved at least this often are never GC'd
@@ -205,6 +206,96 @@ def _load_embedding_matrix(
     # zero / overflow / invalid) under Apple's Accelerate BLAS even though the
     # results are finite and correct (float32 vs float64 differ by ~1e-6).
     return valid_ids, np.array(vectors, dtype=np.float64)
+
+
+_SLEEP_CURSOR_NAME = "candidate_cursor_v1"
+
+
+def _select_cycle_node_ids(
+    conn: sqlite3.Connection, limit: Optional[int],
+) -> List[str]:
+    """Select one deterministic page and durably advance its private cursor.
+
+    Uncapped callers retain the historical full oldest-first pass and do not
+    create cursor state.  Capped callers rotate through ``(timestamp, id)`` so
+    an already-saturated or unproductive oldest page cannot monopolize every
+    cycle.  The cursor claim commits before expensive work: a crash can defer a
+    page until the next wrap, but cannot corrupt the cursor or starve later
+    pages forever.
+    """
+    thought_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(thought_nodes)")
+    }
+    timestamp_expr = (
+        "COALESCE(tn.timestamp, '')" if "timestamp" in thought_columns else "''"
+    )
+    base = (
+        f"SELECT e.node_id, {timestamp_expr} AS sleep_ts "
+        "FROM embeddings e JOIN thought_nodes tn ON e.node_id = tn.id "
+        "WHERE (tn.decayed IS NULL OR tn.decayed = 0) "
+    )
+    order = "ORDER BY sleep_ts ASC, e.node_id ASC "
+    if limit is None:
+        return [row[0] for row in conn.execute(base + order).fetchall()]
+    if limit == 0:
+        return []
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS _cashew_sleep_state ("
+            "name TEXT PRIMARY KEY, cursor_timestamp TEXT NOT NULL, "
+            "cursor_node_id TEXT NOT NULL, epoch INTEGER NOT NULL)"
+        )
+        state = conn.execute(
+            "SELECT cursor_timestamp, cursor_node_id, epoch "
+            "FROM _cashew_sleep_state WHERE name = ?",
+            (_SLEEP_CURSOR_NAME,),
+        ).fetchone()
+        rows: List[tuple] = []
+        epoch = 0
+        if state is not None:
+            cursor_timestamp, cursor_node_id, epoch = state
+            rows.extend(
+                conn.execute(
+                    base
+                    + f"AND ({timestamp_expr} > ? OR "
+                    f"({timestamp_expr} = ? AND e.node_id > ?)) "
+                    + order
+                    + "LIMIT ?",
+                    (cursor_timestamp, cursor_timestamp, cursor_node_id, limit),
+                ).fetchall()
+            )
+        if len(rows) < limit:
+            remaining = limit - len(rows)
+            if state is None:
+                rows.extend(
+                    conn.execute(base + order + "LIMIT ?", (remaining,)).fetchall()
+                )
+            else:
+                cursor_timestamp, cursor_node_id, _ = state
+                rows.extend(
+                    conn.execute(
+                        base
+                        + f"AND ({timestamp_expr} < ? OR "
+                        f"({timestamp_expr} = ? AND e.node_id <= ?)) "
+                        + order
+                        + "LIMIT ?",
+                        (cursor_timestamp, cursor_timestamp, cursor_node_id, remaining),
+                    ).fetchall()
+                )
+        if rows:
+            last_id, last_timestamp = rows[-1]
+            conn.execute(
+                "INSERT OR REPLACE INTO _cashew_sleep_state "
+                "(name, cursor_timestamp, cursor_node_id, epoch) VALUES (?, ?, ?, ?)",
+                (_SLEEP_CURSOR_NAME, last_timestamp, last_id, int(epoch) + 1),
+            )
+        conn.commit()
+        return [row[0] for row in rows]
+    except Exception:
+        conn.rollback()
+        raise
 
 
 # ── Phase 1: candidate discovery (vectorized) ────────────────────────────
@@ -869,67 +960,73 @@ def _embed_orphans(
     embedding_client=None,
     embedding_model: Optional[str] = None,
     expected_dimension: Optional[int] = None,
+    limit: Optional[int] = None,
+    batch_size: int = ORPHANS_PER_BATCH,
     stats: Optional[dict] = None,
 ) -> int:
     """Embed active orphans through the caller-owned ``encode`` client.
 
     The client is injected so sleep never constructs a model or selects a
-    device. Each node is dual-written under a savepoint; a loaded vec index
-    that rejects a write rolls back the ordinary row as well.
+    device. Inference happens one bounded batch at a time before its write
+    transaction. Each node is dual-written under a savepoint; a loaded vec
+    index that rejects a write rolls back the ordinary row as well.
     """
     stats = stats if stats is not None else {}
     stats.setdefault("orphan_write_failed", 0)
     stats.setdefault("orphan_vec_unavailable", 0)
     stats.setdefault("orphan_ordinary_written", 0)
-    rows = conn.execute(
-        "SELECT tn.id, tn.content FROM thought_nodes tn "
-        "LEFT JOIN embeddings e ON tn.id = e.node_id "
-        "WHERE e.node_id IS NULL AND (tn.decayed IS NULL OR tn.decayed = 0) "
-        "AND tn.content IS NOT NULL AND TRIM(tn.content) != ''"
-    ).fetchall()
-    vec_available = _vec_write_capability(conn)
-    repair_rows = []
-    if vec_available:
-        repair_rows = conn.execute(
-            "SELECT e.node_id, e.vector, COALESCE(e.model, '') "
-            "FROM embeddings e LEFT JOIN vec_embeddings v ON v.node_id=e.node_id "
-            "JOIN thought_nodes tn ON tn.id=e.node_id "
-            "WHERE v.node_id IS NULL AND (tn.decayed IS NULL OR tn.decayed=0)"
-        ).fetchall()
-    if not rows and not repair_rows:
+    stats.setdefault("orphan_examined", 0)
+    if limit is not None and (
+        not isinstance(limit, int) or isinstance(limit, bool) or limit < 0
+    ):
+        raise ValueError("invalid_orphan_limit")
+    if (
+        not isinstance(batch_size, int)
+        or isinstance(batch_size, bool)
+        or batch_size <= 0
+        or batch_size > ORPHANS_PER_BATCH
+    ):
+        raise ValueError("invalid_orphan_batch_size")
+    if limit == 0:
         return 0
-    if (rows or repair_rows) and (
+
+    vec_available = _vec_write_capability(conn)
+    ordinary_exists = conn.execute(
+        "SELECT 1 FROM thought_nodes tn LEFT JOIN embeddings e ON tn.id=e.node_id "
+        "WHERE e.node_id IS NULL AND (tn.decayed IS NULL OR tn.decayed=0) "
+        "AND tn.content IS NOT NULL AND TRIM(tn.content) != '' LIMIT 1"
+    ).fetchone()
+    repair_exists = None
+    if vec_available:
+        repair_exists = conn.execute(
+            "SELECT 1 FROM embeddings e LEFT JOIN vec_embeddings v ON v.node_id=e.node_id "
+            "JOIN thought_nodes tn ON tn.id=e.node_id "
+            "WHERE v.node_id IS NULL AND (tn.decayed IS NULL OR tn.decayed=0) LIMIT 1"
+        ).fetchone()
+    if not ordinary_exists and not repair_exists:
+        return 0
+    if (
         embedding_client is None or not embedding_model or
         expected_dimension is None or int(expected_dimension) <= 0
     ):
         stats["capability_missing"] = True
         return 0
+
     expected = int(expected_dimension) if expected_dimension is not None else 0
-    vectors: List[np.ndarray] = []
-    if rows:
-        try:
-            raw = embedding_client.encode([content for _, content in rows])
-            array = np.asarray(raw)
-            if array.shape != (len(rows), expected):
-                raise ValueError("embedding_shape_mismatch")
-            for item in array:
-                vec = np.asarray(item, dtype=np.float32)
-                if not np.all(np.isfinite(vec)) or np.allclose(vec, 0):
-                    raise ValueError("embedding_invalid")
-                vectors.append(vec)
-        except Exception as exc:
-            logger.warning(
-                "sleep: orphan embedding batch rejected: %s", type(exc).__name__
-            )
-            stats["orphan_write_failed"] += len(rows)
-            return 0
     embedded = 0
-    def write_pair(nid: str, blob: bytes, model_name: str) -> None:
-        nonlocal embedded
+    remaining = limit
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(embeddings)")}
+    thought_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(thought_nodes)")
+    }
+    timestamp_expr = (
+        "COALESCE(tn.timestamp, '')" if "timestamp" in thought_columns else "''"
+    )
+
+    def write_pair(nid: str, blob: bytes, model_name: str) -> bool:
         savepoint = "orphan_" + re.sub(r"[^A-Za-z0-9_]", "_", nid)[:40]
         try:
             conn.execute(f"SAVEPOINT {savepoint}")
-            columns = {r[1] for r in conn.execute("PRAGMA table_info(embeddings)")}
             if {"model", "updated_at"}.issubset(columns):
                 conn.execute(
                     "INSERT OR REPLACE INTO embeddings "
@@ -949,42 +1046,155 @@ def _embed_orphans(
                     (nid, blob),
                 )
             conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-            # Count only after the savepoint has released successfully. A
-            # failed vec write must not claim an ordinary row that rolled back.
-            stats["orphan_ordinary_written"] += 1
-            if vec_available:
-                embedded += 1
-            else:
-                stats["orphan_vec_unavailable"] += 1
+            return True
         except Exception as exc:
             try:
                 conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                 conn.execute(f"RELEASE SAVEPOINT {savepoint}")
             except sqlite3.Error:
                 pass
-            stats["orphan_write_failed"] += 1
             logger.warning(
                 "sleep: orphan %s dual-write failed: %s", nid[:8], type(exc).__name__
             )
-    for (nid, _content), vec in zip(rows, vectors):
-        write_pair(nid, vec.tobytes(), str(embedding_model))
-    for nid, blob, stored_model in repair_rows:
+            return False
+
+    def commit_batch(items: List[Tuple[str, bytes, str]]) -> bool:
+        nonlocal embedded
+        if not items:
+            return True
         try:
-            vec = np.frombuffer(blob, dtype=np.float32)
-            if embedding_model and stored_model and stored_model != embedding_model:
-                raise ValueError("embedding_model_mismatch")
-            repair_dim = (
-                int(expected_dimension)
-                if expected_dimension is not None else len(vec)
+            conn.execute("BEGIN IMMEDIATE")
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            stats["orphan_write_failed"] += len(items)
+            logger.warning(
+                "sleep: orphan batch admission failed: %s", type(exc).__name__
             )
-            if (len(vec) != repair_dim or not np.all(np.isfinite(vec))
-                    or np.allclose(vec, 0)):
+            return False
+        written = 0
+        failed = 0
+        for nid, blob, model_name in items:
+            if write_pair(nid, blob, model_name):
+                written += 1
+            else:
+                failed += 1
+        try:
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            stats["orphan_write_failed"] += len(items)
+            logger.warning(
+                "sleep: orphan batch commit failed: %s", type(exc).__name__
+            )
+            return False
+        stats["orphan_write_failed"] += failed
+        stats["orphan_ordinary_written"] += written
+        if vec_available:
+            embedded += written
+        else:
+            stats["orphan_vec_unavailable"] += written
+        return True
+
+    ordinary_cursor: Optional[Tuple[str, str]] = None
+    while remaining is None or remaining > 0:
+        take = batch_size if remaining is None else min(batch_size, remaining)
+        cursor_sql = ""
+        params: List[object] = []
+        if ordinary_cursor is not None:
+            cursor_sql = (
+                f"AND ({timestamp_expr} > ? OR "
+                f"({timestamp_expr} = ? AND tn.id > ?)) "
+            )
+            params.extend(
+                [ordinary_cursor[0], ordinary_cursor[0], ordinary_cursor[1]]
+            )
+        params.append(take)
+        rows = conn.execute(
+            f"SELECT tn.id, tn.content, {timestamp_expr} FROM thought_nodes tn "
+            "LEFT JOIN embeddings e ON tn.id = e.node_id "
+            "WHERE e.node_id IS NULL AND (tn.decayed IS NULL OR tn.decayed = 0) "
+            "AND tn.content IS NOT NULL AND TRIM(tn.content) != '' "
+            + cursor_sql
+            + f"ORDER BY {timestamp_expr}, tn.id LIMIT ?",
+            params,
+        ).fetchall()
+        if not rows:
+            break
+        stats["orphan_examined"] += len(rows)
+        if remaining is not None:
+            remaining -= len(rows)
+        ordinary_cursor = (rows[-1][2], rows[-1][0])
+        try:
+            raw = embedding_client.encode([content for _, content, _ in rows])
+            array = np.asarray(raw)
+            if array.shape != (len(rows), expected):
+                raise ValueError("embedding_shape_mismatch")
+            vectors = [np.asarray(item, dtype=np.float32) for item in array]
+            if any(
+                not np.all(np.isfinite(vec)) or np.allclose(vec, 0)
+                for vec in vectors
+            ):
                 raise ValueError("embedding_invalid")
-        except (TypeError, ValueError, BufferError):
-            stats["orphan_write_failed"] += 1
-            continue
-        write_pair(nid, bytes(blob), stored_model or str(embedding_model or ""))
-    conn.commit()
+        except Exception as exc:
+            logger.warning(
+                "sleep: orphan embedding batch rejected: %s", type(exc).__name__
+            )
+            stats["orphan_write_failed"] += len(rows)
+            break
+        if not commit_batch([
+            (nid, vec.tobytes(), str(embedding_model))
+            for (nid, _content, _timestamp), vec in zip(rows, vectors)
+        ]):
+            break
+
+    repair_cursor: Optional[Tuple[str, str]] = None
+    while vec_available and (remaining is None or remaining > 0):
+        take = batch_size if remaining is None else min(batch_size, remaining)
+        cursor_sql = ""
+        params = []
+        if repair_cursor is not None:
+            cursor_sql = (
+                f"AND ({timestamp_expr} > ? OR "
+                f"({timestamp_expr} = ? AND e.node_id > ?)) "
+            )
+            params.extend([repair_cursor[0], repair_cursor[0], repair_cursor[1]])
+        params.append(take)
+        repair_rows = conn.execute(
+            "SELECT e.node_id, e.vector, "
+            + ("COALESCE(e.model, '')" if "model" in columns else "''")
+            + f", {timestamp_expr} FROM embeddings e "
+            "LEFT JOIN vec_embeddings v ON v.node_id=e.node_id "
+            "JOIN thought_nodes tn ON tn.id=e.node_id "
+            "WHERE v.node_id IS NULL AND (tn.decayed IS NULL OR tn.decayed=0) "
+            + cursor_sql
+            + f"ORDER BY {timestamp_expr}, e.node_id LIMIT ?",
+            params,
+        ).fetchall()
+        if not repair_rows:
+            break
+        stats["orphan_examined"] += len(repair_rows)
+        if remaining is not None:
+            remaining -= len(repair_rows)
+        repair_cursor = (repair_rows[-1][3], repair_rows[-1][0])
+        items: List[Tuple[str, bytes, str]] = []
+        for nid, blob, stored_model, _timestamp in repair_rows:
+            try:
+                vec = np.frombuffer(blob, dtype=np.float32)
+                if embedding_model and stored_model and stored_model != embedding_model:
+                    raise ValueError("embedding_model_mismatch")
+                if (len(vec) != expected or not np.all(np.isfinite(vec))
+                        or np.allclose(vec, 0)):
+                    raise ValueError("embedding_invalid")
+            except (TypeError, ValueError, BufferError):
+                stats["orphan_write_failed"] += 1
+                continue
+            items.append((nid, bytes(blob), stored_model or str(embedding_model)))
+        if not commit_batch(items):
+            break
+
     logger.info("sleep: embedded/repaired %d orphaned nodes", embedded)
     return embedded
 
@@ -1000,6 +1210,8 @@ def _run_dream_async(
     embedding_model: Optional[str] = None,
     expected_dimension: Optional[int] = None,
     journal_policy: str = "manage",
+    orphan_limit: Optional[int] = None,
+    orphan_batch_size: int = ORPHANS_PER_BATCH,
 ) -> None:
     """Run Phase 8 (dream) + Phase 9 (orphan embedding) in a daemon thread.
 
@@ -1017,6 +1229,7 @@ def _run_dream_async(
             orphans = _embed_orphans(
                 conn, embedding_client=embedding_client,
                 embedding_model=embedding_model, expected_dimension=expected_dimension,
+                limit=orphan_limit, batch_size=orphan_batch_size,
             )
             logger.info(
                 "sleep: background dream complete (id=%s, orphans=%d)",
@@ -1078,6 +1291,8 @@ def run_sleep_cycle(
     embedding_model: Optional[str] = None,
     expected_dimension: Optional[int] = None,
     journal_policy: str = "manage",
+    orphan_limit: Optional[int] = None,
+    orphan_batch_size: int = ORPHANS_PER_BATCH,
 ) -> dict:
     """Run one complete refactored sleep cycle.
 
@@ -1104,6 +1319,12 @@ def run_sleep_cycle(
     cross_source_only : bool
         When True, only cross-link pairs from different ``source_file``
         values (reduces same-source noise).
+    orphan_limit : Optional[int]
+        Maximum orphan rows examined across both repair passes. ``None`` keeps
+        the historical behavior of repairing every eligible orphan.
+    orphan_batch_size : int
+        Encode and commit at most this many orphans at once. Values from 1 to
+        100 are accepted so bounded embedding clients are never overfilled.
 
     Returns
     -------
@@ -1123,6 +1344,19 @@ def run_sleep_cycle(
             return _empty_sleep_result("rejected", "invalid_limit")
         if not isinstance(max_edges, int) or max_edges < 0:
             return _empty_sleep_result("rejected", "invalid_max_edges")
+        if orphan_limit is not None and (
+            not isinstance(orphan_limit, int)
+            or isinstance(orphan_limit, bool)
+            or orphan_limit < 0
+        ):
+            return _empty_sleep_result("rejected", "invalid_orphan_limit")
+        if (
+            not isinstance(orphan_batch_size, int)
+            or isinstance(orphan_batch_size, bool)
+            or orphan_batch_size <= 0
+            or orphan_batch_size > ORPHANS_PER_BATCH
+        ):
+            return _empty_sleep_result("rejected", "invalid_orphan_batch_size")
         supplied_embedding = (
             embedding_client is not None,
             bool(embedding_model),
@@ -1162,25 +1396,8 @@ def run_sleep_cycle(
             return _empty_sleep_result("unavailable", "no_embeddings_table",
                                        time.perf_counter() - t_start)
 
-        # ── Select nodes for this cycle (oldest-first) ──
-        if limit is None:
-            rows = conn.execute(
-                "SELECT e.node_id FROM embeddings e "
-                "JOIN thought_nodes tn ON e.node_id = tn.id "
-                "WHERE (tn.decayed IS NULL OR tn.decayed = 0) "
-                "ORDER BY tn.timestamp ASC"
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT e.node_id FROM embeddings e "
-                "JOIN thought_nodes tn ON e.node_id = tn.id "
-                "WHERE (tn.decayed IS NULL OR tn.decayed = 0) "
-                "ORDER BY tn.timestamp ASC "
-                "LIMIT ?",
-                (limit,),
-            ).fetchall()
-
-        ids = [r[0] for r in rows]
+        # ── Select one fair deterministic page for this cycle ──
+        ids = _select_cycle_node_ids(conn, limit)
         logger.info("sleep: selected %d nodes (limit=%s)", len(ids), limit)
 
         valid_ids, matrix = _load_embedding_matrix(conn, ids, expected_dimension)
@@ -1193,15 +1410,11 @@ def run_sleep_cycle(
                 embedding_client=embedding_client,
                 embedding_model=embedding_model,
                 expected_dimension=expected_dimension,
+                limit=orphan_limit,
+                batch_size=orphan_batch_size,
                 stats=orphan_stats,
             )
-            rows = conn.execute(
-                "SELECT e.node_id FROM embeddings e "
-                "JOIN thought_nodes tn ON e.node_id = tn.id "
-                "WHERE (tn.decayed IS NULL OR tn.decayed = 0) "
-                "ORDER BY tn.timestamp ASC"
-            ).fetchall()
-            ids = [r[0] for r in rows]
+            ids = _select_cycle_node_ids(conn, limit)
             valid_ids, matrix = _load_embedding_matrix(conn, ids, expected_dimension)
             progress.update({
                 "nodes_selected": len(ids),
@@ -1324,6 +1537,11 @@ def run_sleep_cycle(
         # Phase 8: dream generation
         dream_id = None
         dream_pending = False
+        remaining_orphan_limit = (
+            None
+            if orphan_limit is None
+            else max(0, orphan_limit - orphan_stats.get("orphan_examined", 0))
+        )
         if model_fn is not None and cross_link_tuples:
             if background_dream:
                 _run_dream_async(
@@ -1332,6 +1550,8 @@ def run_sleep_cycle(
                     model_fn=model_fn,
                     embedding_client=embedding_client, embedding_model=embedding_model,
                     expected_dimension=expected_dimension, journal_policy=journal_policy,
+                    orphan_limit=remaining_orphan_limit,
+                    orphan_batch_size=orphan_batch_size,
                 )
                 dream_pending = True
             else:
@@ -1345,28 +1565,23 @@ def run_sleep_cycle(
 
         # Phase 9: embed orphans
         if background_dream:
-            orphans = 0  # handled by background dream thread
+            # Preserve any synchronous prefix needed to establish two anchors;
+            # late background repairs are reported only in the worker log.
+            pass
         else:
-            later_orphan_stats: dict = {}
             later_orphans = _embed_orphans(
                 conn, embedding_client=embedding_client, embedding_model=embedding_model,
-                expected_dimension=expected_dimension, stats=later_orphan_stats,
+                expected_dimension=expected_dimension,
+                limit=remaining_orphan_limit,
+                batch_size=orphan_batch_size,
+                stats=orphan_stats,
             )
             orphans += later_orphans
-            for key in ("orphan_write_failed", "orphan_vec_unavailable",
-                        "orphan_ordinary_written"):
-                orphan_stats[key] = orphan_stats.get(key, 0) + later_orphan_stats.get(key, 0)
-            orphan_stats["capability_missing"] = (
-                orphan_stats.get("capability_missing", False)
-                or later_orphan_stats.get("capability_missing", False)
-            )
         progress["orphans_embedded"] = orphans
         progress["orphan_ordinary_written"] = orphan_stats.get(
             "orphan_ordinary_written", 0
         )
 
-        if background_dream:
-            orphan_stats = {}
         conn.close()
         elapsed = round(time.perf_counter() - t_start, 1)
 
@@ -1580,7 +1795,8 @@ class SleepProtocol:
             LLM callable for dream generation.
         **kwargs
             Passed through to :func:`run_sleep_cycle`: ``limit``,
-            ``background_dream``, ``max_edges``, ``cross_source_only``.
+            ``background_dream``, ``max_edges``, ``cross_source_only``,
+            ``orphan_limit``, and ``orphan_batch_size``.
         """
         conn = self._get_connection()
         active_count = conn.execute(
@@ -1599,6 +1815,8 @@ class SleepProtocol:
             embedding_model=kwargs.get("embedding_model"),
             expected_dimension=kwargs.get("expected_dimension"),
             journal_policy=kwargs.get("journal_policy", "manage"),
+            orphan_limit=kwargs.get("orphan_limit"),
+            orphan_batch_size=kwargs.get("orphan_batch_size", ORPHANS_PER_BATCH),
         )
 
         # Map vectorized result back to old-style summary keys for compat

@@ -65,6 +65,38 @@ def _cycle_db(tmp_path: Path, name: str = "cycle.db") -> Path:
     return path
 
 
+def _add_four_fairness_nodes(path: Path) -> None:
+    conn = sqlite3.connect(str(path))
+    conn.execute("DELETE FROM embeddings")
+    conn.execute("DELETE FROM thought_nodes")
+    for index, node_id in enumerate(("a", "b", "c", "d"), start=1):
+        vector = np.zeros(1024, dtype=np.float32)
+        vector[index - 1] = 1.0
+        conn.execute(
+            "INSERT INTO thought_nodes(id, content, timestamp) VALUES (?, ?, ?)",
+            (node_id, node_id, f"2026-01-0{index}T00:00:00+00:00"),
+        )
+        conn.execute(
+            "INSERT INTO embeddings(node_id, vector, model) VALUES (?, ?, ?)",
+            (node_id, vector.tobytes(), "thenlper/gte-large"),
+        )
+    conn.commit()
+    conn.close()
+
+
+def _neutralize_post_pair_phases(monkeypatch) -> None:
+    monkeypatch.setattr(sleep_module, "_compute_metrics", lambda _conn: {})
+    monkeypatch.setattr(sleep_module, "_garbage_collect", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        sleep_module, "_evaluate_permanence", lambda _conn: {"nodes_promoted": 0}
+    )
+    monkeypatch.setattr(
+        sleep_module,
+        "_promote_core_memories",
+        lambda _conn, _metrics: {"promoted": 0, "demoted": 0},
+    )
+
+
 def test_cross_link_cap_flushes_two_directed_rows(tmp_path):
     conn = _edge_db(tmp_path)
     stats = _batch_cross_links(
@@ -74,6 +106,86 @@ def test_cross_link_cap_flushes_two_directed_rows(tmp_path):
     assert stats["directed_rows"] == 2
     assert conn.execute("SELECT count(*) FROM derivation_edges").fetchone()[0] == 2
     conn.close()
+
+
+def test_capped_candidate_pages_rotate_across_four_nodes(tmp_path, monkeypatch):
+    path = _cycle_db(tmp_path, "fair-pages.db")
+    _add_four_fairness_nodes(path)
+    selected = []
+
+    def capture(ids, _matrix, **_kwargs):
+        selected.append(list(ids))
+        empty = np.empty((0, 2), dtype=int)
+        return empty, empty, np.eye(len(ids))
+
+    monkeypatch.setattr(sleep_module, "_find_pairs", capture)
+    _neutralize_post_pair_phases(monkeypatch)
+    before_conn = sqlite3.connect(str(path))
+    before = before_conn.execute(
+        "SELECT id, timestamp FROM thought_nodes ORDER BY id"
+    ).fetchall()
+    before_conn.close()
+
+    for _ in range(2):
+        result = run_sleep_cycle(db_path=str(path), limit=2, journal_policy="preserve")
+        assert result["status"] == "completed"
+
+    assert selected == [["a", "b"], ["c", "d"]]
+    check = sqlite3.connect(str(path))
+    assert check.execute(
+        "SELECT epoch FROM _cashew_sleep_state WHERE name='candidate_cursor_v1'"
+    ).fetchone()[0] == 2
+    assert check.execute(
+        "SELECT id, timestamp FROM thought_nodes ORDER BY id"
+    ).fetchall() == before
+    check.close()
+
+
+def test_cursor_survives_interruption_then_wrap_repairs_half_pair(tmp_path, monkeypatch):
+    path = _cycle_db(tmp_path, "fair-restart.db")
+    _add_four_fairness_nodes(path)
+    conn = sqlite3.connect(str(path))
+    conn.execute("INSERT INTO derivation_edges VALUES ('a','b',.92,'existing half')")
+    conn.commit()
+    before = conn.execute(
+        "SELECT id, timestamp FROM thought_nodes ORDER BY id"
+    ).fetchall()
+    conn.close()
+    calls = []
+
+    def interrupt_once(ids, _matrix, **_kwargs):
+        calls.append(list(ids))
+        if len(calls) == 1:
+            raise RuntimeError("interrupted after durable page claim")
+        sim = np.eye(2, dtype=np.float64)
+        sim[0, 1] = sim[1, 0] = 0.92
+        return np.asarray([[0, 1]]), np.empty((0, 2), dtype=int), sim
+
+    monkeypatch.setattr(sleep_module, "_find_pairs", interrupt_once)
+    _neutralize_post_pair_phases(monkeypatch)
+    failed = run_sleep_cycle(db_path=str(path), limit=2, journal_policy="preserve")
+    assert failed["status"] == "failed"
+    assert failed["error"] == "sleep_cycle_failed"
+
+    next_page = run_sleep_cycle(db_path=str(path), limit=2, journal_policy="preserve")
+    wrapped = run_sleep_cycle(db_path=str(path), limit=2, journal_policy="preserve")
+    assert calls == [["a", "b"], ["c", "d"], ["a", "b"]]
+    assert next_page["cross_links_created"] == 1
+    assert wrapped["cross_links_created"] == 0
+    assert wrapped["cross_links_repaired"] == 1
+
+    check = sqlite3.connect(str(path))
+    assert check.execute(
+        "SELECT count(*) FROM derivation_edges WHERE "
+        "(parent_id='a' AND child_id='b') OR (parent_id='b' AND child_id='a')"
+    ).fetchone()[0] == 2
+    assert check.execute(
+        "SELECT epoch FROM _cashew_sleep_state WHERE name='candidate_cursor_v1'"
+    ).fetchone()[0] == 3
+    assert check.execute(
+        "SELECT id, timestamp FROM thought_nodes ORDER BY id"
+    ).fetchall() == before
+    check.close()
 
 
 def test_cross_link_repairs_half_pair_and_counts_one_row(tmp_path):
@@ -124,6 +236,31 @@ def test_cross_link_cap_batches_at_five_hundred_pairs(tmp_path, pair_count):
 def test_run_sleep_cycle_preserves_six_positional_arguments():
     signature = inspect.signature(run_sleep_cycle)
     signature.bind("/tmp/example.db", None, None, False, 1, True)
+    assert signature.parameters["orphan_limit"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert (
+        signature.parameters["orphan_batch_size"].kind
+        is inspect.Parameter.KEYWORD_ONLY
+    )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error"),
+    [
+        ({"orphan_limit": -1}, "invalid_orphan_limit"),
+        ({"orphan_limit": True}, "invalid_orphan_limit"),
+        ({"orphan_batch_size": 0}, "invalid_orphan_batch_size"),
+        ({"orphan_batch_size": 101}, "invalid_orphan_batch_size"),
+    ],
+)
+def test_orphan_bounds_are_rejected_before_database_open(monkeypatch, kwargs, error):
+    monkeypatch.setattr(
+        sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: pytest.fail("database must not open"),
+    )
+    result = run_sleep_cycle(db_path="/tmp/does-not-exist.db", **kwargs)
+    assert result["status"] == "rejected"
+    assert result["error"] == error
 
 
 def test_partial_embedding_triad_is_rejected_before_database_open(monkeypatch):
@@ -214,6 +351,179 @@ def test_orphan_invalid_batch_writes_nothing(tmp_path):
     )
     assert conn.execute("SELECT count(*) FROM embeddings").fetchone()[0] == 0
     assert stats["orphan_write_failed"] == 1
+    conn.close()
+
+
+def test_orphan_batches_101_rows_with_supervisor_compatible_ceiling(
+    tmp_path, monkeypatch
+):
+    conn = _orphan_db(tmp_path)
+    conn.execute("UPDATE thought_nodes SET id='n000' WHERE id='n1'")
+    conn.executemany(
+        "INSERT INTO thought_nodes(id, content, timestamp) VALUES (?, ?, ?)",
+        [(f"n{i:03d}", f"orphan {i}", "2026-01-01T00:00:00+00:00")
+         for i in range(1, 101)],
+    )
+    conn.commit()
+
+    class BoundedClient:
+        def __init__(self):
+            self.calls = []
+            self.offset = 0
+
+        def encode(self, texts):
+            assert len(texts) <= 100
+            self.calls.append(list(texts))
+            result = np.zeros((len(texts), 384), dtype=np.float32)
+            for row in range(len(texts)):
+                result[row, self.offset + row] = 1.0
+            self.offset += len(texts)
+            return result
+
+    client = BoundedClient()
+    conn.close()
+    _neutralize_post_pair_phases(monkeypatch)
+    result = run_sleep_cycle(
+        db_path=str(tmp_path / "orphans.db"),
+        limit=2,
+        embedding_client=client,
+        embedding_model="all-MiniLM-L6-v2",
+        expected_dimension=384,
+        journal_policy="preserve",
+        orphan_limit=101,
+        orphan_batch_size=100,
+    )
+    assert [len(call) for call in client.calls] == [100, 1]
+    assert client.calls[0][:2] == ["orphan", "orphan 1"]
+    assert client.calls[1] == ["orphan 100"]
+    assert result["orphans_embedded"] == 101
+    assert result["orphan_write_failed"] == 0
+    assert set(result) == set(_empty_sleep_result("completed", None))
+    check = sqlite3.connect(str(tmp_path / "orphans.db"))
+    assert check.execute("SELECT count(*) FROM embeddings").fetchone()[0] == 101
+    assert check.execute("SELECT count(*) FROM vec_embeddings").fetchone()[0] == 101
+    check.close()
+
+
+def test_orphan_encode_runs_before_write_transaction(tmp_path):
+    conn = _orphan_db(tmp_path)
+    conn.execute("CREATE TABLE writer_probe(value TEXT)")
+    conn.commit()
+
+    class ConcurrentWriterClient:
+        def encode(self, texts):
+            assert conn.in_transaction is False
+            writer = sqlite3.connect(str(tmp_path / "orphans.db"), timeout=0.1)
+            writer.execute("INSERT INTO writer_probe VALUES ('during encode')")
+            writer.commit()
+            writer.close()
+            return np.ones((len(texts), 4), dtype=np.float32)
+
+    assert _embed_orphans(
+        conn,
+        embedding_client=ConcurrentWriterClient(),
+        embedding_model="m",
+        expected_dimension=4,
+        batch_size=1,
+    ) == 1
+    assert conn.execute("SELECT value FROM writer_probe").fetchone()[0] == "during encode"
+    conn.close()
+
+
+def test_orphan_batch_failure_preserves_committed_prefix_for_restart(
+    tmp_path, monkeypatch
+):
+    conn = _orphan_db(tmp_path)
+    conn.execute("UPDATE thought_nodes SET id='n000' WHERE id='n1'")
+    conn.executemany(
+        "INSERT INTO thought_nodes(id, content, timestamp) VALUES (?, ?, ?)",
+        [(f"n{i:03d}", f"orphan {i}", f"{i:03d}") for i in range(1, 101)],
+    )
+    conn.commit()
+
+    class InterruptedClient:
+        def __init__(self):
+            self.calls = 0
+
+        def encode(self, texts):
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("worker exited")
+            return np.ones((len(texts), 384), dtype=np.float32)
+
+    conn.close()
+    empty = np.empty((0, 2), dtype=int)
+    monkeypatch.setattr(
+        sleep_module,
+        "_find_pairs",
+        lambda ids, _matrix, **_kwargs: (empty, empty, np.eye(len(ids))),
+    )
+    _neutralize_post_pair_phases(monkeypatch)
+    result = run_sleep_cycle(
+        db_path=str(tmp_path / "orphans.db"),
+        limit=2,
+        embedding_client=InterruptedClient(),
+        embedding_model="all-MiniLM-L6-v2",
+        expected_dimension=384,
+        journal_policy="preserve",
+        orphan_limit=101,
+        orphan_batch_size=100,
+    )
+    assert result["status"] == "partial"
+    assert result["error"] == "orphan_write_failed"
+    assert result["orphans_embedded"] == 100
+    assert result["orphan_write_failed"] == 1
+    assert set(result) == set(_empty_sleep_result("partial", "orphan_write_failed"))
+
+    conn = sqlite3.connect(str(tmp_path / "orphans.db"))
+    assert conn.execute("SELECT count(*) FROM embeddings").fetchone()[0] == 100
+    assert conn.execute("SELECT count(*) FROM vec_embeddings").fetchone()[0] == 100
+
+    restart = _Client(lambda n: np.ones((n, 384), dtype=np.float32))
+    assert _embed_orphans(
+        conn,
+        embedding_client=restart,
+        embedding_model="all-MiniLM-L6-v2",
+        expected_dimension=384,
+        limit=1,
+        batch_size=1,
+    ) == 1
+    assert conn.execute("SELECT count(*) FROM embeddings").fetchone()[0] == 101
+    assert conn.execute("SELECT count(*) FROM vec_embeddings").fetchone()[0] == 101
+    conn.close()
+
+
+def test_orphan_limit_caps_ordinary_present_vec_missing_rows(tmp_path):
+    conn = _orphan_db(tmp_path)
+    vec = np.ones(4, dtype=np.float32).tobytes()
+    conn.executemany(
+        "INSERT INTO thought_nodes(id, content, timestamp) VALUES (?, ?, ?)",
+        [("n2", "two", "2"), ("n3", "three", "3")],
+    )
+    conn.executemany(
+        "INSERT INTO embeddings(node_id, vector, model) VALUES (?, ?, 'm')",
+        [("n1", vec), ("n2", vec), ("n3", vec)],
+    )
+    conn.commit()
+
+    class MustNotEncode:
+        def encode(self, _texts):
+            raise AssertionError("existing vectors must be reused")
+
+    stats = {}
+    assert _embed_orphans(
+        conn,
+        embedding_client=MustNotEncode(),
+        embedding_model="m",
+        expected_dimension=4,
+        limit=2,
+        batch_size=1,
+        stats=stats,
+    ) == 2
+    assert stats["orphan_examined"] == 2
+    assert [row[0] for row in conn.execute(
+        "SELECT node_id FROM vec_embeddings ORDER BY node_id"
+    )] == ["n1", "n2"]
     conn.close()
 
 
