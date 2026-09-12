@@ -1050,7 +1050,6 @@ def _empty_sleep_result(
         "dedup_components": 0, "dedup_nodes_merged": 0,
         "nodes_gc_decayed": 0, "nodes_made_permanent": 0,
         "core_promoted": 0, "core_demoted": 0, "orphans_embedded": 0,
-        "orphan_ordinary_written": 0,
         "orphan_write_failed": 0, "orphan_vec_unavailable": 0,
         "vec_rows_compacted": 0, "dream_id": None, "dream_pending": False,
         "dream_generation": "skipped", "elapsed_s": max(0.0, float(elapsed_s)),
@@ -1220,9 +1219,6 @@ def run_sleep_cycle(
                 result["nodes_selected"] = len(ids)
                 result["nodes_with_embeddings"] = len(valid_ids)
                 result["orphans_embedded"] = orphans
-                result["orphan_ordinary_written"] = orphan_stats.get(
-                    "orphan_ordinary_written", 0
-                )
                 result["orphan_write_failed"] = orphan_stats.get("orphan_write_failed", 0)
                 result["orphan_vec_unavailable"] = orphan_stats.get(
                     "orphan_vec_unavailable", 0
@@ -1448,7 +1444,6 @@ def run_sleep_cycle(
             "dream_pending": dream_pending,
             "dream_generation": dream_generation,
             "orphans_embedded": orphans,
-            "orphan_ordinary_written": orphan_stats.get("orphan_ordinary_written", 0),
             "orphan_write_failed": orphan_stats.get("orphan_write_failed", 0),
             "orphan_vec_unavailable": orphan_stats.get("orphan_vec_unavailable", 0),
             "total_nodes": len(metrics),

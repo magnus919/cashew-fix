@@ -235,7 +235,6 @@ def test_orphan_vec_failure_rolls_back_ordinary_row(tmp_path):
     )
     assert conn.execute("SELECT count(*) FROM embeddings").fetchone()[0] == 0
     assert stats["orphan_write_failed"] == 1
-    assert stats.get("orphan_ordinary_written", 0) == 0
     conn.close()
 
 
@@ -400,7 +399,9 @@ def test_early_orphan_commit_survives_candidate_discovery_failure(tmp_path, monk
     assert result["status"] == "partial"
     assert result["error"] == "sleep_cycle_failed"
     assert result["orphans_embedded"] == 2
-    assert result["orphan_ordinary_written"] == 2
+    check = sqlite3.connect(str(tmp_path / "orphans.db"))
+    assert check.execute("SELECT count(*) FROM embeddings").fetchone()[0] == 2
+    check.close()
 
 
 def test_late_orphan_failure_retains_committed_dream_fields(tmp_path, monkeypatch):
@@ -618,7 +619,6 @@ def test_public_cycle_reports_ordinary_only_orphan_write(tmp_path):
     )
     assert result["status"] == "partial"
     assert result["error"] == "vec_capability_unavailable"
-    assert result["orphan_ordinary_written"] == 1
     assert result["orphan_vec_unavailable"] == 1
     check = sqlite3.connect(str(tmp_path / "orphans.db"))
     assert check.execute("SELECT count(*) FROM embeddings").fetchone()[0] == 1
