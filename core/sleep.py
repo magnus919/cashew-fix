@@ -211,6 +211,70 @@ def _load_embedding_matrix(
 _SLEEP_CURSOR_NAME = "candidate_cursor_v1"
 
 
+def _create_sleep_state_table(conn: sqlite3.Connection) -> None:
+    """Create the private cursor table in its current on-disk shape."""
+    conn.execute(
+        "CREATE TABLE _cashew_sleep_state ("
+        "name TEXT PRIMARY KEY, cursor_timestamp TEXT NOT NULL, "
+        "cursor_node_id TEXT NOT NULL, epoch INTEGER NOT NULL)"
+    )
+
+
+def _ensure_sleep_state_schema(conn: sqlite3.Connection) -> None:
+    """Validate or transactionally migrate the private cursor table.
+
+    The table was introduced as private state and has no user-owned columns.
+    Rebuilding a partial shape is safer than letting a later cursor query fail
+    halfway through sleep.  A usable legacy cursor is retained; otherwise the
+    next page starts at the deterministic beginning.
+    """
+    entry = conn.execute(
+        "SELECT type FROM sqlite_master WHERE name='_cashew_sleep_state'"
+    ).fetchone()
+    if entry is None:
+        _create_sleep_state_table(conn)
+        return
+    if entry[0] != "table":
+        raise sqlite3.DatabaseError("sleep_state_schema_invalid")
+
+    info = conn.execute("PRAGMA table_info(_cashew_sleep_state)").fetchall()
+    shape = [(row[1], (row[2] or "").upper(), row[3], row[5]) for row in info]
+    expected = [
+        ("name", "TEXT", 0, 1),
+        ("cursor_timestamp", "TEXT", 1, 0),
+        ("cursor_node_id", "TEXT", 1, 0),
+        ("epoch", "INTEGER", 1, 0),
+    ]
+    if shape == expected:
+        return
+
+    columns = {row[1] for row in info}
+    saved = None
+    cursor_columns = {"name", "cursor_timestamp", "cursor_node_id"}
+    if cursor_columns.issubset(columns):
+        epoch_expr = "epoch" if "epoch" in columns else "0"
+        row = conn.execute(
+            "SELECT cursor_timestamp, cursor_node_id, " + epoch_expr + " "
+            "FROM _cashew_sleep_state WHERE name=? LIMIT 1",
+            (_SLEEP_CURSOR_NAME,),
+        ).fetchone()
+        if row is not None and row[0] is not None and row[1] is not None:
+            try:
+                epoch = max(0, int(row[2]))
+            except (TypeError, ValueError, OverflowError):
+                epoch = 0
+            saved = (str(row[0]), str(row[1]), epoch)
+
+    conn.execute("DROP TABLE _cashew_sleep_state")
+    _create_sleep_state_table(conn)
+    if saved is not None:
+        conn.execute(
+            "INSERT INTO _cashew_sleep_state "
+            "(name, cursor_timestamp, cursor_node_id, epoch) VALUES (?, ?, ?, ?)",
+            (_SLEEP_CURSOR_NAME, *saved),
+        )
+
+
 def _select_cycle_node_ids(
     conn: sqlite3.Connection, limit: Optional[int],
 ) -> List[str]:
@@ -242,11 +306,7 @@ def _select_cycle_node_ids(
 
     try:
         conn.execute("BEGIN IMMEDIATE")
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS _cashew_sleep_state ("
-            "name TEXT PRIMARY KEY, cursor_timestamp TEXT NOT NULL, "
-            "cursor_node_id TEXT NOT NULL, epoch INTEGER NOT NULL)"
-        )
+        _ensure_sleep_state_schema(conn)
         state = conn.execute(
             "SELECT cursor_timestamp, cursor_node_id, epoch "
             "FROM _cashew_sleep_state WHERE name = ?",
@@ -362,9 +422,13 @@ def _batch_cross_links(
         "candidates": len(cross_pairs), "created": 0, "repaired": 0,
         "skipped": 0, "failed": 0, "directed_rows": 0,
         "same_source_skipped": 0, "capped": False,
+        # Private handoff to dream generation.  Entries are added only after
+        # the transaction containing both directed rows commits.
+        "dream_pairs": [],
     }
     t0 = time.perf_counter()
     dirty = False
+    pending_dream_pairs: List[Tuple[str, str, float]] = []
     for pair_no, (i, j) in enumerate(cross_pairs):
         budget = stats["created"] + stats["repaired"]
         if max_edges is not None and budget >= max_edges:
@@ -419,11 +483,15 @@ def _batch_cross_links(
         else:
             stats["created"] += 1
         stats["directed_rows"] += len(missing)
-        if dirty and (pair_no + 1) % EDGES_PER_BATCH == 0:
+        pending_dream_pairs.append((n1, n2, weight))
+        if dirty and len(pending_dream_pairs) >= EDGES_PER_BATCH:
             conn.commit()
+            stats["dream_pairs"].extend(pending_dream_pairs)
+            pending_dream_pairs.clear()
             dirty = False
     if dirty:
         conn.commit()
+        stats["dream_pairs"].extend(pending_dream_pairs)
     elapsed = time.perf_counter() - t0
     logger.info(
         "sleep: cross-links %d created, %d repaired, %d skipped in %.1fs",
@@ -1476,11 +1544,7 @@ def run_sleep_cycle(
                 max_edges=max_edges,
             )
             if model_fn is not None:
-                for i, j in cross_pairs:
-                    cross_link_tuples.append((
-                        valid_ids[int(i)], valid_ids[int(j)],
-                        float(sim[int(i), int(j)]),
-                    ))
+                cross_link_tuples = list(cross_stats.get("dream_pairs", ()))
 
         # Preserve committed work if a later phase fails.  The outer failure
         # boundary below returns this snapshot instead of erasing persisted

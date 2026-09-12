@@ -13,6 +13,7 @@ from core.decay_audit import ensure_decay_audit_schema
 import core.sleep as sleep_module
 from core.sleep import (
     _batch_cross_links, _embed_orphans, _empty_sleep_result,
+    _ensure_sleep_state_schema,
     _vec_write_capability, run_sleep_cycle,
 )
 
@@ -104,6 +105,7 @@ def test_cross_link_cap_flushes_two_directed_rows(tmp_path):
     )
     assert stats["created"] == 1
     assert stats["directed_rows"] == 2
+    assert stats["dream_pairs"] == [("a", "b", 0.0)]
     assert conn.execute("SELECT count(*) FROM derivation_edges").fetchone()[0] == 2
     conn.close()
 
@@ -197,6 +199,7 @@ def test_cross_link_repairs_half_pair_and_counts_one_row(tmp_path):
     )
     assert stats["created"] == 0 and stats["repaired"] == 1
     assert stats["directed_rows"] == 1
+    assert stats["dream_pairs"] == [("a", "b", 0.0)]
     assert conn.execute("SELECT count(*) FROM derivation_edges").fetchone()[0] == 2
     conn.close()
 
@@ -214,7 +217,38 @@ def test_cross_link_trigger_suppression_is_not_claimed(tmp_path):
     )
     assert stats["created"] == 0
     assert stats["failed"] == 1
+    assert stats["dream_pairs"] == []
     assert conn.execute("SELECT count(*) FROM derivation_edges").fetchone()[0] == 0
+    conn.close()
+
+
+def test_existing_complete_pair_is_not_reused_for_dream(tmp_path):
+    conn = _edge_db(tmp_path)
+    conn.executemany(
+        "INSERT INTO derivation_edges VALUES (?, ?, .9, 'old')",
+        [("a", "b"), ("b", "a")],
+    )
+    conn.commit()
+    stats = _batch_cross_links(
+        conn, ["a", "b"], np.array([[0, 1]]), np.eye(2), max_edges=1
+    )
+    assert stats["skipped"] == 1
+    assert stats["dream_pairs"] == []
+    conn.close()
+
+
+def test_dream_pairs_stop_at_successful_pair_cap(tmp_path):
+    conn = _edge_db(tmp_path)
+    stats = _batch_cross_links(
+        conn,
+        ["a", "b", "c", "d"],
+        np.array([[0, 1], [2, 3]]),
+        np.eye(4),
+        max_edges=1,
+    )
+    assert stats["capped"] is True
+    assert stats["dream_pairs"] == [("a", "b", 0.0)]
+    assert conn.execute("SELECT count(*) FROM derivation_edges").fetchone()[0] == 2
     conn.close()
 
 
@@ -228,6 +262,7 @@ def test_cross_link_cap_batches_at_five_hundred_pairs(tmp_path, pair_count):
     stats = _batch_cross_links(conn, ids, pairs, sim, max_edges=pair_count)
     assert stats["created"] == pair_count
     assert stats["directed_rows"] == pair_count * 2
+    assert len(stats["dream_pairs"]) == pair_count
     assert conn.execute("SELECT count(*) FROM derivation_edges").fetchone()[0] == pair_count * 2
     assert conn.commit_count - baseline_commit_count <= 2
     conn.close()
@@ -831,32 +866,91 @@ def test_public_cycle_exposes_cross_link_failure(tmp_path, monkeypatch):
     assert result["error"] == "cross_link_failed"
 
 
-def test_zero_prefix_dream_failure_is_failed(tmp_path, monkeypatch):
+def test_max_edges_zero_never_dreams_from_uncommitted_candidates(tmp_path, monkeypatch):
     path = _cycle_db(tmp_path, "zero-dream.db")
     conn = sqlite3.connect(str(path))
+    first = np.zeros(1024, dtype=np.float32)
+    first[0] = 1.0
+    second = np.zeros(1024, dtype=np.float32)
+    second[0] = 0.92
+    second[1] = np.sqrt(1.0 - 0.92 ** 2)
     conn.execute("UPDATE thought_nodes SET source_file='one.md' WHERE id='a'")
     conn.execute("UPDATE thought_nodes SET source_file='two.md' WHERE id='b'")
+    conn.execute("UPDATE embeddings SET vector=? WHERE node_id='a'", (first.tobytes(),))
+    conn.execute("UPDATE embeddings SET vector=? WHERE node_id='b'", (second.tobytes(),))
     conn.commit()
     conn.close()
-    monkeypatch.setattr(
-        sleep_module, "_find_pairs",
-        lambda *_args, **_kwargs: (
-            np.asarray([[0, 1]]), np.empty((0, 2), dtype=int), np.eye(2)
-        ),
-    )
-    monkeypatch.setattr(
-        sleep_module, "_batch_cross_links",
-        lambda *_args, **_kwargs: {"created": 0, "repaired": 0, "skipped": 0,
-                                   "failed": 0, "directed_rows": 0},
-    )
-    monkeypatch.setattr(sleep_module, "_evaluate_permanence", lambda *_args: {"nodes_promoted": 0})
-    monkeypatch.setattr(sleep_module, "_promote_core_memories", lambda *_args: {"promoted": 0, "demoted": 0})
+    _neutralize_post_pair_phases(monkeypatch)
+    prompts = []
     result = run_sleep_cycle(
-        db_path=str(path), model_fn=lambda _prompt: "too short", journal_policy="preserve"
+        db_path=str(path), model_fn=prompts.append, max_edges=0,
+        journal_policy="preserve",
     )
-    assert result["dream_generation"] == "failed"
-    assert result["status"] == "failed"
-    assert result["error"] == "dream_failed"
+    assert result["cross_link_candidates"] == 1
+    assert result["cross_link_capped"] is True
+    assert result["cross_links_created"] == 0
+    assert result["dream_generation"] == "skipped"
+    assert result["status"] == "completed"
+    assert prompts == []
+    check = sqlite3.connect(str(path))
+    assert check.execute("SELECT count(*) FROM derivation_edges").fetchone()[0] == 0
+    assert check.execute("SELECT count(*) FROM thought_nodes WHERE node_type='dream'").fetchone()[0] == 0
+    check.close()
+
+
+def test_sleep_state_partial_schema_migrates_and_keeps_cursor(tmp_path, monkeypatch):
+    path = _cycle_db(tmp_path, "partial-state.db")
+    _add_four_fairness_nodes(path)
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        "CREATE TABLE _cashew_sleep_state("
+        "name TEXT, cursor_timestamp TEXT, cursor_node_id TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO _cashew_sleep_state VALUES (?, ?, ?)",
+        ("candidate_cursor_v1", "2026-01-02T00:00:00+00:00", "b"),
+    )
+    conn.commit()
+    conn.close()
+    selected = []
+
+    def capture(ids, _matrix, **_kwargs):
+        selected.append(list(ids))
+        empty = np.empty((0, 2), dtype=int)
+        return empty, empty, np.eye(len(ids))
+
+    monkeypatch.setattr(sleep_module, "_find_pairs", capture)
+    _neutralize_post_pair_phases(monkeypatch)
+    result = run_sleep_cycle(db_path=str(path), limit=2, journal_policy="preserve")
+    assert result["status"] == "completed"
+    assert selected == [["c", "d"]]
+    check = sqlite3.connect(str(path))
+    columns = [row[1] for row in check.execute("PRAGMA table_info(_cashew_sleep_state)")]
+    assert columns == ["name", "cursor_timestamp", "cursor_node_id", "epoch"]
+    assert check.execute(
+        "SELECT epoch FROM _cashew_sleep_state WHERE name='candidate_cursor_v1'"
+    ).fetchone() == (1,)
+    check.close()
+
+
+def test_sleep_state_malformed_schema_rebuilds_idempotently(tmp_path):
+    conn = sqlite3.connect(str(tmp_path / "state.db"))
+    conn.execute("CREATE TABLE _cashew_sleep_state(unrelated TEXT)")
+    conn.execute("BEGIN IMMEDIATE")
+    _ensure_sleep_state_schema(conn)
+    _ensure_sleep_state_schema(conn)
+    conn.commit()
+    shape = [
+        (row[1], (row[2] or "").upper(), row[3], row[5])
+        for row in conn.execute("PRAGMA table_info(_cashew_sleep_state)")
+    ]
+    assert shape == [
+        ("name", "TEXT", 0, 1),
+        ("cursor_timestamp", "TEXT", 1, 0),
+        ("cursor_node_id", "TEXT", 1, 0),
+        ("epoch", "INTEGER", 1, 0),
+    ]
+    conn.close()
 
 
 def test_synchronous_dream_reports_ran(tmp_path, monkeypatch):
@@ -878,6 +972,7 @@ def test_synchronous_dream_reports_ran(tmp_path, monkeypatch):
         model_fn=lambda _prompt: "A durable relationship connects these two observations.",
         journal_policy="preserve",
     )
+    assert result["cross_links_created"] == 1
     assert result["dream_generation"] == "ran"
     assert result["dream_id"]
     check = sqlite3.connect(str(path))
@@ -888,6 +983,35 @@ def test_synchronous_dream_reports_ran(tmp_path, monkeypatch):
         "SELECT count(*) FROM derivation_edges WHERE child_id=?", (result["dream_id"],)
     ).fetchone()[0] == 2
     check.close()
+
+
+def test_repaired_half_pair_can_drive_dream(tmp_path, monkeypatch):
+    path = _cycle_db(tmp_path, "repair-dream.db")
+    conn = sqlite3.connect(str(path))
+    first = np.zeros(1024, dtype=np.float32)
+    first[0] = 1.0
+    second = np.zeros(1024, dtype=np.float32)
+    second[0] = 0.92
+    second[1] = np.sqrt(1.0 - 0.92 ** 2)
+    conn.execute("UPDATE thought_nodes SET source_file='one.md' WHERE id='a'")
+    conn.execute("UPDATE thought_nodes SET source_file='two.md' WHERE id='b'")
+    conn.execute("UPDATE embeddings SET vector=? WHERE node_id='a'", (first.tobytes(),))
+    conn.execute("UPDATE embeddings SET vector=? WHERE node_id='b'", (second.tobytes(),))
+    conn.execute(
+        "INSERT INTO derivation_edges VALUES "
+        "('a', 'b', .92, 'existing half')"
+    )
+    conn.commit()
+    conn.close()
+    result = run_sleep_cycle(
+        db_path=str(path),
+        model_fn=lambda _prompt: "A durable relationship connects these observations.",
+        journal_policy="preserve",
+    )
+    assert result["cross_links_created"] == 0
+    assert result["cross_links_repaired"] == 1
+    assert result["dream_generation"] == "ran"
+    assert result["dream_id"]
 
 
 def test_public_cycle_repairs_orphan_before_anchor_requirement(tmp_path):

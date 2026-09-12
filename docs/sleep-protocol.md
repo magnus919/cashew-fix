@@ -31,7 +31,39 @@ When `limit` caps candidate discovery, sleep persists a private cursor and
 rotates deterministically through `(timestamp, node_id)` pages. Cursor claims
 commit before expensive phases, so a stopped cycle may defer its page until
 the next wrap but cannot keep later pages permanently starved. Node timestamps
-remain untouched.
+remain untouched. The private cursor table is checked on every capped run;
+partial or malformed pre-release shapes are rebuilt transactionally, retaining
+a usable cursor when possible.
+
+## Supported work envelope
+
+The public limits bound specific phases; they are not an end-to-end deadline:
+
+- `limit=N` bounds the candidate embedding matrix to at most `N` active nodes.
+  Similarity memory and arithmetic are quadratic in `N`.
+- `max_edges=M` bounds newly completed or repaired unordered cross-link pairs.
+  Existing, same-source, or failed candidates do not consume the budget, so
+  candidate inspection can still visit every pair in the `N`-node matrix.
+- deduplication consumes the same bounded candidate page, but maximal-clique
+  enumeration and edge rewiring do not currently have a separate time or write
+  budget.
+- GC mutates at most 50 sampled nodes and orphan embedding examines at most
+  `orphan_limit` rows when supplied. Metrics, permanence, core-memory ranking,
+  audit cleanup, and vec compaction can still scan graph-wide state.
+- a synchronous `model_fn` has no engine-enforced deadline. Integrations that
+  need a wall-clock bound must own cancellation and SQLite admission outside
+  this function.
+
+Dream generation only receives cross-link pairs completed or repaired and
+committed by the current cycle. Capped, filtered, failed, and already-complete
+pairs are excluded. In particular, `max_edges=0` cannot invoke the dream model.
+
+For reproducible local measurements, `scripts/benchmark_sleep_cycle.py` builds
+an isolated synthetic database and reports wall time plus the public counters.
+It never opens the configured Cashew database. `--hold-writer-ms` adds a
+deterministic competing write transaction before the cycle starts. Results
+characterize the chosen machine and fixture; they do not establish a
+production deadline.
 
 `journal_policy="manage"` retains the historical direct-call behavior.
 Integrations that own SQLite admission should pass `journal_policy="preserve"`;
