@@ -53,6 +53,27 @@ def ensure_decay_audit_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    # Some early installations created only a subset of the additive audit
+    # columns.  Migrate those tables in place, retaining all existing rows.
+    required = {
+        "id": "INTEGER",
+        "node_id": "TEXT",
+        "content_summary": "TEXT",
+        "decay_reason": "TEXT",
+        "confidence_at_decay": "REAL",
+        "access_count_at_decay": "INTEGER",
+        "last_access_date": "TEXT",
+        "related_nodes": "TEXT",
+        "source_file": "TEXT",
+        "domain": "TEXT",
+        "node_type": "TEXT",
+        "decay_timestamp": "TEXT",
+        "metadata": "TEXT",
+    }
+    present = {row[1] for row in conn.execute("PRAGMA table_info(decay_audit)")}
+    for name, sql_type in required.items():
+        if name not in present:
+            conn.execute(f"ALTER TABLE decay_audit ADD COLUMN {name} {sql_type}")
 
 
 def _summary(content: Optional[str]) -> str:

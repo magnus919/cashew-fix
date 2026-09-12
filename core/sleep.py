@@ -262,10 +262,10 @@ def _batch_cross_links(
 ) -> dict:
     """Insert cross-link pairs atomically, with pair-budget accounting.
 
-    Each candidate is committed in a savepoint and verified in both
-    directions. This keeps a trigger, constraint, or interrupted write from
-    producing a claimed half-pair. Existing complete pairs consume no budget;
-    a single-direction legacy pair is repaired and consumes one pair.
+    Each candidate is isolated in a savepoint and verified in both directions.
+    Successful pairs are committed in bounded batches so a trigger,
+    constraint, or interrupted write cannot produce a claimed half-pair while
+    a large cycle still avoids one transaction per edge.
     """
     stats = {
         "candidates": len(cross_pairs), "created": 0, "repaired": 0,
@@ -273,6 +273,7 @@ def _batch_cross_links(
         "same_source_skipped": 0, "capped": False,
     }
     t0 = time.perf_counter()
+    dirty = False
     for pair_no, (i, j) in enumerate(cross_pairs):
         budget = stats["created"] + stats["repaired"]
         if max_edges is not None and budget >= max_edges:
@@ -312,7 +313,7 @@ def _batch_cross_links(
             if len(final) != 2:
                 raise sqlite3.IntegrityError("cross_link_pair_not_persisted")
             conn.execute(f"RELEASE SAVEPOINT {name}")
-            conn.commit()
+            dirty = True
         except Exception as exc:
             try:
                 conn.execute(f"ROLLBACK TO SAVEPOINT {name}")
@@ -327,6 +328,11 @@ def _batch_cross_links(
         else:
             stats["created"] += 1
         stats["directed_rows"] += len(missing)
+        if dirty and (pair_no + 1) % EDGES_PER_BATCH == 0:
+            conn.commit()
+            dirty = False
+    if dirty:
+        conn.commit()
     elapsed = time.perf_counter() - t0
     logger.info(
         "sleep: cross-links %d created, %d repaired, %d skipped in %.1fs",
@@ -836,14 +842,28 @@ def _vec_write_capability(conn: sqlite3.Connection) -> bool:
     if "using vec0" not in ddl:
         return True
     try:
-        from .embeddings import _load_vec, _vec_available
-        if not _vec_available:
-            return False
-        _load_vec(conn)
+        import sqlite_vec
+    except ImportError:
+        return False
+    try:
+        conn.enable_load_extension(True)
+        try:
+            sqlite_vec.load(conn)
+        except (OSError, sqlite3.OperationalError) as exc:
+            # Only failure to load the optional extension is ordinary-only
+            # degradation. Once loaded, schema/query failures are real errors.
+            text = str(exc).lower()
+            if any(token in text for token in
+                   ("not authorized", "cannot load", "no such module", "unable to load")):
+                return False
+            raise
         conn.execute("SELECT count(*) FROM vec_embeddings").fetchone()
         return True
-    except (ImportError, sqlite3.Error, OSError):
-        return False
+    finally:
+        try:
+            conn.enable_load_extension(False)
+        except sqlite3.Error:
+            pass
 
 
 def _embed_orphans(
@@ -880,8 +900,10 @@ def _embed_orphans(
         ).fetchall()
     if not rows and not repair_rows:
         return 0
-    if rows and (embedding_client is None or not embedding_model or
-                 expected_dimension is None or int(expected_dimension) <= 0):
+    if (rows or repair_rows) and (
+        embedding_client is None or not embedding_model or
+        expected_dimension is None or int(expected_dimension) <= 0
+    ):
         stats["capability_missing"] = True
         return 0
     expected = int(expected_dimension) if expected_dimension is not None else 0
@@ -945,18 +967,18 @@ def _embed_orphans(
     for (nid, _content), vec in zip(rows, vectors):
         write_pair(nid, vec.tobytes(), str(embedding_model))
     for nid, blob, stored_model in repair_rows:
-        vec = np.frombuffer(blob, dtype=np.float32)
-        if embedding_model and stored_model and stored_model != embedding_model:
-            stats["orphan_write_failed"] += 1
-            continue
-        repair_dim = (
-            int(expected_dimension)
-            if expected_dimension is not None else len(vec)
-        )
-        if len(vec) != repair_dim:
-            stats["orphan_write_failed"] += 1
-            continue
-        if not np.all(np.isfinite(vec)) or np.allclose(vec, 0):
+        try:
+            vec = np.frombuffer(blob, dtype=np.float32)
+            if embedding_model and stored_model and stored_model != embedding_model:
+                raise ValueError("embedding_model_mismatch")
+            repair_dim = (
+                int(expected_dimension)
+                if expected_dimension is not None else len(vec)
+            )
+            if (len(vec) != repair_dim or not np.all(np.isfinite(vec))
+                    or np.allclose(vec, 0)):
+                raise ValueError("embedding_invalid")
+        except (TypeError, ValueError, BufferError):
             stats["orphan_write_failed"] += 1
             continue
         write_pair(nid, bytes(blob), stored_model or str(embedding_model or ""))
@@ -1079,6 +1101,7 @@ def run_sleep_cycle(
     """
     conn = None
     t_start = time.perf_counter()
+    progress = _empty_sleep_result("failed", "sleep_cycle_failed")
     try:
         if db_path is None:
             db_path = get_db_path()
@@ -1102,12 +1125,15 @@ def run_sleep_cycle(
             or expected_dimension <= 0
         ):
             return _empty_sleep_result("rejected", "invalid_embedding_contract")
-        profile = None
-        if embedding_model:
-            try:
-                profile = _get_active_profile(embedding_model)
-            except Exception:
+        try:
+            profile = _get_active_profile(embedding_model)
+        except Exception:
+            if embedding_model:
                 return _empty_sleep_result("rejected", "uncalibrated_embedding_model")
+            profile = None
+        if all(supplied_embedding) and profile is not None:
+            if profile.dim != expected_dimension:
+                return _empty_sleep_result("rejected", "embedding_dimension_mismatch")
         conn = sqlite3.connect(db_path)
         conn.execute("PRAGMA busy_timeout = 5000")
         if journal_policy == "manage":
@@ -1204,10 +1230,30 @@ def run_sleep_cycle(
                         float(sim[int(i), int(j)]),
                     ))
 
+        # Preserve committed work if a later phase fails.  The outer failure
+        # boundary below returns this snapshot instead of erasing persisted
+        # cross-link progress.
+        progress.update({
+            "nodes_selected": len(ids),
+            "nodes_with_embeddings": len(valid_ids),
+            "cross_link_candidates": len(cross_pairs),
+            "cross_links_created": cross_stats.get("created", 0),
+            "cross_links_repaired": cross_stats.get("repaired", 0),
+            "cross_links_skipped": cross_stats.get("skipped", 0),
+            "cross_link_directed_rows": cross_stats.get("directed_rows", 0),
+            "cross_link_same_source_skipped": cross_stats.get("same_source_skipped", 0),
+            "cross_link_capped": cross_stats.get("capped", False),
+            "dedup_candidates": len(dedup_pairs),
+        })
+
         # Phase 3: dedup
         dedup_stats = {"components": 0, "nodes_merged": 0}
         if len(dedup_pairs) > 0:
             dedup_stats = _run_dedup(conn, valid_ids, dedup_pairs)
+        progress.update({
+            "dedup_components": dedup_stats.get("components", 0),
+            "dedup_nodes_merged": dedup_stats.get("nodes_merged", 0),
+        })
 
         # Phase 4: metrics
         metrics = _compute_metrics(conn)
@@ -1225,12 +1271,16 @@ def run_sleep_cycle(
             think_cycle_penalty=gc_think_cycle_penalty_val,
             mode=gc_mode,
         ))
+        progress["nodes_gc_decayed"] = gc_count
 
         # Phase 6: permanence
         perm_stats = _evaluate_permanence(conn)
+        progress["nodes_made_permanent"] = perm_stats.get("nodes_promoted", 0)
 
         # Phase 7: core memory
         core_stats = _promote_core_memories(conn, metrics)
+        progress["core_promoted"] = core_stats.get("promoted", 0)
+        progress["core_demoted"] = core_stats.get("demoted", 0)
 
         # Phase 8: dream generation
         dream_id = None
@@ -1264,6 +1314,7 @@ def run_sleep_cycle(
         elapsed = round(time.perf_counter() - t_start, 1)
 
         # Decay-audit GC (one-shot per cycle)
+        audit_conn = None
         try:
             audit_conn = sqlite3.connect(db_path)
             audit_conn.execute("PRAGMA busy_timeout = 5000")
@@ -1272,11 +1323,13 @@ def run_sleep_cycle(
             ensure_decay_audit_schema(audit_conn)
             audit_pruned = gc_decay_audit(audit_conn, retention_days=7)
             audit_conn.commit()
-            audit_conn.close()
             if audit_pruned:
                 logger.info("sleep: decay-audit GC pruned %d rows", audit_pruned)
         except Exception as e:
             logger.warning("sleep: decay-audit GC failed: %s", e)
+        finally:
+            if audit_conn is not None:
+                audit_conn.close()
 
         # Vec-index compaction (one-shot per cycle): decay never touched the vec
         # index, so prune rows for nodes decayed this cycle (and any backlog) to
@@ -1301,7 +1354,10 @@ def run_sleep_cycle(
             or dedup_stats.get("nodes_merged", 0) or gc_count
             or perm_stats.get("nodes_promoted", 0) or core_stats.get("promoted", 0)
         )
-        if orphan_stats.get("capability_missing"):
+        if cross_stats.get("failed"):
+            result_status = "partial" if phase_committed else "failed"
+            result_error = "cross_link_failed"
+        elif orphan_stats.get("capability_missing"):
             result_status = "partial" if phase_committed else "unavailable"
             result_error = "embedding_capability_unavailable"
         elif orphan_stats.get("orphan_vec_unavailable"):
@@ -1369,6 +1425,16 @@ def run_sleep_cycle(
 
     except Exception as exc:
         logger.warning("sleep: cycle failed: %s", type(exc).__name__)
+        persisted = progress.get("cross_links_created", 0) + progress.get(
+            "cross_links_repaired", 0
+        ) + progress.get("dedup_nodes_merged", 0) + progress.get(
+            "nodes_gc_decayed", 0
+        )
+        if persisted:
+            progress["status"] = "partial"
+            progress["error"] = "sleep_cycle_failed"
+            progress["elapsed_s"] = round(time.perf_counter() - t_start, 1)
+            return progress
         return _empty_sleep_result("failed", "sleep_cycle_failed",
                                    time.perf_counter() - t_start)
     finally:
