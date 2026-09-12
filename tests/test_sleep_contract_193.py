@@ -185,7 +185,7 @@ def test_orphan_without_vec_is_explicit_ordinary_only(tmp_path):
 
 
 def test_real_sqlite_vec0_dual_write_when_extension_is_available(tmp_path):
-    sqlite_vec = pytest.importorskip("sqlite_vec")
+    pytest.importorskip("sqlite_vec")
     from core.embeddings import _load_vec
 
     conn = _orphan_db(tmp_path)
@@ -214,7 +214,8 @@ def test_public_cycle_repairs_orphan_before_anchor_requirement(tmp_path):
     conn = _orphan_db(tmp_path)
     anchor = np.ones(4, dtype=np.float32).tobytes()
     conn.execute(
-        "INSERT INTO embeddings VALUES ('anchor', ?, 'all-MiniLM-L6-v2', datetime('now'))",
+        "INSERT INTO embeddings VALUES "
+        "('anchor', ?, 'all-MiniLM-L6-v2', datetime('now'))",
         (anchor,),
     )
     conn.execute(
