@@ -25,7 +25,9 @@ ordinary row is rolled back too. If the vec index is genuinely absent,
 ordinary-only repair is reported by `orphan_vec_unavailable`. The default
 repairs all eligible rows in batches of 100 for backward compatibility.
 `orphan_limit` caps rows examined across ordinary and vec-index repair;
-`orphan_batch_size` may reduce the encode/commit batch below 100.
+`orphan_batch_size` may reduce the encode/commit batch below 100. A table merely
+named `vec_embeddings` is not a vec capability: it must be a `vec0` virtual
+table that can be loaded and queried on the active connection.
 
 When `limit` caps candidate discovery, sleep persists a private cursor and
 rotates deterministically through `(timestamp, node_id)` pages. Cursor claims
@@ -33,7 +35,11 @@ commit before expensive phases, so a stopped cycle may defer its page until
 the next wrap but cannot keep later pages permanently starved. Node timestamps
 remain untouched. The private cursor table is checked on every capped run;
 partial or malformed pre-release shapes are rebuilt transactionally, retaining
-a usable cursor when possible.
+a single type-valid cursor when possible. Duplicate or invalid legacy cursor
+rows reset to the deterministic origin. Capped orphan work has separate durable
+ordinary and vec-repair cursors and alternates which phase receives the first
+share of the cap. A repeatedly failing oldest batch therefore cannot starve
+later rows or the other repair class forever.
 
 ## Supported work envelope
 
@@ -75,3 +81,7 @@ state (`skipped`, `pending`, `ran`, or `failed`), and explicit pair versus
 directed-row counts. `cross_links_created` counts new unordered pairs only when
 both directions are committed. A half-pair is repaired and counted separately;
 existing complete pairs are skipped without consuming `max_edges`.
+Cross-link counters and dream inputs advance only after each batch commit. A
+known rolled-back suffix reports the exact committed prefix as `partial`; if a
+commit's durability cannot be verified, the stable result instead reports
+`uncertain` without claiming the attempted batch.

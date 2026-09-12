@@ -170,9 +170,12 @@ def test_embed_orphans_uses_injected_model_and_batch_protocol(tmp_path):
 
     db = str(tmp_path / "orphan.db")
     conn = sqlite3.connect(db)
+    pytest.importorskip("sqlite_vec")
+    from core.embeddings import _load_vec
+    _load_vec(conn)
     conn.execute("CREATE TABLE thought_nodes (id TEXT PRIMARY KEY, content TEXT, decayed INTEGER DEFAULT 0)")
     conn.execute("CREATE TABLE embeddings (node_id TEXT PRIMARY KEY, vector BLOB, model TEXT, updated_at TEXT)")
-    conn.execute("CREATE TABLE vec_embeddings (node_id TEXT PRIMARY KEY, embedding BLOB)")
+    conn.execute("CREATE VIRTUAL TABLE vec_embeddings USING vec0(node_id text primary key, embedding float[3])")
     conn.execute("INSERT INTO thought_nodes (id, content) VALUES ('n1', 'an orphan node')")
     conn.commit()
 
@@ -198,9 +201,12 @@ def test_embed_orphans_writes_vec_index_row(tmp_path):
 
     db = str(tmp_path / "orphan.db")
     conn = sqlite3.connect(db)
+    pytest.importorskip("sqlite_vec")
+    from core.embeddings import _load_vec
+    _load_vec(conn)
     conn.execute("CREATE TABLE thought_nodes (id TEXT PRIMARY KEY, content TEXT, decayed INTEGER DEFAULT 0)")
     conn.execute("CREATE TABLE embeddings (node_id TEXT PRIMARY KEY, vector BLOB, model TEXT, updated_at TEXT)")
-    conn.execute("CREATE TABLE vec_embeddings (node_id TEXT PRIMARY KEY, embedding BLOB)")
+    conn.execute("CREATE VIRTUAL TABLE vec_embeddings USING vec0(node_id text primary key, embedding float[4])")
     conn.execute("INSERT INTO thought_nodes (id, content) VALUES ('n1', 'an orphan node')")
     conn.commit()
 

@@ -14,6 +14,7 @@ import core.sleep as sleep_module
 from core.sleep import (
     _batch_cross_links, _embed_orphans, _empty_sleep_result,
     _ensure_sleep_state_schema,
+    _select_cycle_node_ids,
     _vec_write_capability, run_sleep_cycle,
 )
 
@@ -204,6 +205,160 @@ def test_cross_link_repairs_half_pair_and_counts_one_row(tmp_path):
     conn.close()
 
 
+def test_public_cycle_reports_exact_prefix_when_final_cross_commit_fails(
+    tmp_path, monkeypatch,
+):
+    path = _cycle_db(tmp_path, "cross-prefix.db")
+    conn = sqlite3.connect(str(path))
+    conn.execute("DELETE FROM embeddings")
+    conn.execute("DELETE FROM thought_nodes")
+    vector = np.ones(1024, dtype=np.float32).tobytes()
+    rows = [(f"n{i:04d}", f"node {i}") for i in range(1002)]
+    conn.executemany("INSERT INTO thought_nodes(id, content) VALUES (?, ?)", rows)
+    conn.executemany(
+        "INSERT INTO embeddings(node_id, vector, model) VALUES (?, ?, ?)",
+        [(node_id, vector, "thenlper/gte-large") for node_id, _ in rows],
+    )
+    conn.commit()
+    conn.close()
+
+    pairs = np.asarray([(i, i + 1) for i in range(0, 1002, 2)], dtype=int)
+    monkeypatch.setattr(
+        sleep_module,
+        "_find_pairs",
+        lambda ids, _matrix, **_kwargs: (
+            pairs, np.empty((0, 2), dtype=int), np.ones((len(ids), len(ids))),
+        ),
+    )
+    _neutralize_post_pair_phases(monkeypatch)
+    real_connect = sqlite3.connect
+
+    class FailFinalCommit(sqlite3.Connection):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.commit_calls = 0
+
+        def commit(self):
+            self.commit_calls += 1
+            if self.commit_calls == 2:
+                raise sqlite3.OperationalError("synthetic final commit failure")
+            return super().commit()
+
+    first = True
+
+    def connect(database, *args, **kwargs):
+        nonlocal first
+        if first and str(database) == str(path):
+            first = False
+            kwargs["factory"] = FailFinalCommit
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sleep_module.sqlite3, "connect", connect)
+    dream_inputs = []
+
+    def capture_dream(_conn, tuples, model_fn):
+        dream_inputs.extend(tuples)
+        return None
+
+    monkeypatch.setattr(sleep_module, "_generate_dream", capture_dream)
+    result = run_sleep_cycle(
+        db_path=str(path), model_fn=lambda _prompt: "unused",
+        journal_policy="preserve",
+    )
+
+    assert result["status"] == "partial"
+    assert result["error"] == "cross_link_failed"
+    assert result["cross_links_created"] == 500
+    assert result["cross_link_directed_rows"] == 1000
+    assert len(dream_inputs) == 500
+    assert dream_inputs[-1][:2] == ("n0998", "n0999")
+    assert set(result) == set(_empty_sleep_result("partial", "cross_link_failed"))
+    check = real_connect(str(path))
+    assert check.execute("SELECT count(*) FROM derivation_edges").fetchone()[0] == 1000
+    check.close()
+
+
+def test_public_cycle_reports_uncertain_when_commit_cannot_be_verified(
+    tmp_path, monkeypatch,
+):
+    path = _cycle_db(tmp_path, "cross-uncertain.db")
+    monkeypatch.setattr(
+        sleep_module,
+        "_find_pairs",
+        lambda *_args, **_kwargs: (
+            np.asarray([[0, 1]]), np.empty((0, 2), dtype=int), np.eye(2),
+        ),
+    )
+    real_connect = sqlite3.connect
+
+    class UnknownCommit(sqlite3.Connection):
+        def commit(self):
+            raise sqlite3.OperationalError("synthetic ambiguous commit")
+
+        def execute(self, sql, *args, **kwargs):
+            if sql.startswith("SELECT count(*) FROM derivation_edges"):
+                raise sqlite3.OperationalError("synthetic verification failure")
+            return super().execute(sql, *args, **kwargs)
+
+    first = True
+
+    def connect(database, *args, **kwargs):
+        nonlocal first
+        if first and str(database) == str(path):
+            first = False
+            kwargs["factory"] = UnknownCommit
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sleep_module.sqlite3, "connect", connect)
+    result = run_sleep_cycle(db_path=str(path), journal_policy="preserve")
+    assert result["status"] == "uncertain"
+    assert result["error"] == "cross_link_commit_uncertain"
+    assert result["cross_links_created"] == 0
+    assert result["cross_link_directed_rows"] == 0
+    assert set(result) == set(
+        _empty_sleep_result("uncertain", "cross_link_commit_uncertain")
+    )
+
+
+def test_public_cycle_counts_commit_that_succeeds_before_wrapper_error(
+    tmp_path, monkeypatch,
+):
+    path = _cycle_db(tmp_path, "cross-post-commit.db")
+    monkeypatch.setattr(
+        sleep_module,
+        "_find_pairs",
+        lambda *_args, **_kwargs: (
+            np.asarray([[0, 1]]), np.empty((0, 2), dtype=int), np.eye(2),
+        ),
+    )
+    _neutralize_post_pair_phases(monkeypatch)
+    real_connect = sqlite3.connect
+
+    class PostCommitError(sqlite3.Connection):
+        def commit(self):
+            super().commit()
+            raise sqlite3.OperationalError("synthetic post-commit wrapper failure")
+
+    first = True
+
+    def connect(database, *args, **kwargs):
+        nonlocal first
+        if first and str(database) == str(path):
+            first = False
+            kwargs["factory"] = PostCommitError
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sleep_module.sqlite3, "connect", connect)
+    result = run_sleep_cycle(db_path=str(path), journal_policy="preserve")
+    assert result["status"] == "partial"
+    assert result["error"] == "cross_link_failed"
+    assert result["cross_links_created"] == 1
+    assert result["cross_link_directed_rows"] == 2
+    check = real_connect(str(path))
+    assert check.execute("SELECT count(*) FROM derivation_edges").fetchone() == (2,)
+    check.close()
+
+
 def test_cross_link_trigger_suppression_is_not_claimed(tmp_path):
     conn = _edge_db(tmp_path)
     conn.execute(
@@ -264,7 +419,7 @@ def test_cross_link_cap_batches_at_five_hundred_pairs(tmp_path, pair_count):
     assert stats["directed_rows"] == pair_count * 2
     assert len(stats["dream_pairs"]) == pair_count
     assert conn.execute("SELECT count(*) FROM derivation_edges").fetchone()[0] == pair_count * 2
-    assert conn.commit_count - baseline_commit_count <= 2
+    assert conn.commit_count - baseline_commit_count == (pair_count + 499) // 500
     conn.close()
 
 
@@ -341,7 +496,7 @@ class _Client:
         return self.value(len(texts)) if callable(self.value) else self.value
 
 
-def _orphan_db(tmp_path: Path, vec: bool = True):
+def _orphan_db(tmp_path: Path, vec: bool = True, dimension: int = 4):
     conn = sqlite3.connect(str(tmp_path / "orphans.db"))
     conn.execute(
         "CREATE TABLE thought_nodes("
@@ -360,8 +515,14 @@ def _orphan_db(tmp_path: Path, vec: bool = True):
         "PRIMARY KEY(parent_id, child_id))"
     )
     if vec:
+        pytest.importorskip("sqlite_vec")
+        from core.embeddings import _load_vec
+
+        _load_vec(conn)
         conn.execute(
-            "CREATE TABLE vec_embeddings(node_id TEXT PRIMARY KEY, embedding BLOB)"
+            "CREATE VIRTUAL TABLE vec_embeddings USING vec0("
+            f"node_id text primary key, embedding float[{dimension}] "
+            "distance_metric=cosine)"
         )
     conn.execute(
         "INSERT INTO thought_nodes (id, content, decayed) VALUES ('n1','orphan',0)"
@@ -392,7 +553,7 @@ def test_orphan_invalid_batch_writes_nothing(tmp_path):
 def test_orphan_batches_101_rows_with_supervisor_compatible_ceiling(
     tmp_path, monkeypatch
 ):
-    conn = _orphan_db(tmp_path)
+    conn = _orphan_db(tmp_path, dimension=384)
     conn.execute("UPDATE thought_nodes SET id='n000' WHERE id='n1'")
     conn.executemany(
         "INSERT INTO thought_nodes(id, content, timestamp) VALUES (?, ?, ?)",
@@ -435,6 +596,8 @@ def test_orphan_batches_101_rows_with_supervisor_compatible_ceiling(
     assert result["orphan_write_failed"] == 0
     assert set(result) == set(_empty_sleep_result("completed", None))
     check = sqlite3.connect(str(tmp_path / "orphans.db"))
+    from core.embeddings import _load_vec
+    _load_vec(check)
     assert check.execute("SELECT count(*) FROM embeddings").fetchone()[0] == 101
     assert check.execute("SELECT count(*) FROM vec_embeddings").fetchone()[0] == 101
     check.close()
@@ -468,7 +631,7 @@ def test_orphan_encode_runs_before_write_transaction(tmp_path):
 def test_orphan_batch_failure_preserves_committed_prefix_for_restart(
     tmp_path, monkeypatch
 ):
-    conn = _orphan_db(tmp_path)
+    conn = _orphan_db(tmp_path, dimension=384)
     conn.execute("UPDATE thought_nodes SET id='n000' WHERE id='n1'")
     conn.executemany(
         "INSERT INTO thought_nodes(id, content, timestamp) VALUES (?, ?, ?)",
@@ -511,6 +674,8 @@ def test_orphan_batch_failure_preserves_committed_prefix_for_restart(
     assert set(result) == set(_empty_sleep_result("partial", "orphan_write_failed"))
 
     conn = sqlite3.connect(str(tmp_path / "orphans.db"))
+    from core.embeddings import _load_vec
+    _load_vec(conn)
     assert conn.execute("SELECT count(*) FROM embeddings").fetchone()[0] == 100
     assert conn.execute("SELECT count(*) FROM vec_embeddings").fetchone()[0] == 100
 
@@ -562,14 +727,100 @@ def test_orphan_limit_caps_ordinary_present_vec_missing_rows(tmp_path):
     conn.close()
 
 
-def test_orphan_vec_failure_rolls_back_ordinary_row(tmp_path):
-    conn = _orphan_db(tmp_path)
-    conn.execute("DROP TABLE vec_embeddings")
-    conn.execute(
-        "CREATE TABLE vec_embeddings("
-        "node_id TEXT PRIMARY KEY, embedding BLOB NOT NULL CHECK(length(embedding)<1))"
+def test_capped_orphan_failures_advance_durable_cursor(tmp_path):
+    conn = _orphan_db(tmp_path, vec=False)
+    conn.execute("UPDATE thought_nodes SET id='one', content='one', timestamp='1'")
+    conn.executemany(
+        "INSERT INTO thought_nodes(id, content, timestamp) VALUES (?, ?, ?)",
+        [("two", "two", "2"), ("three", "three", "3")],
     )
     conn.commit()
+
+    class RejectEveryPage:
+        def __init__(self):
+            self.calls = []
+
+        def encode(self, texts):
+            self.calls.append(list(texts))
+            raise RuntimeError("synthetic worker rejection")
+
+    client = RejectEveryPage()
+    for _ in range(3):
+        stats = {}
+        assert _embed_orphans(
+            conn,
+            embedding_client=client,
+            embedding_model="m",
+            expected_dimension=4,
+            limit=1,
+            batch_size=1,
+            stats=stats,
+        ) == 0
+        assert stats["orphan_examined"] == 1
+        assert stats["orphan_write_failed"] == 1
+    assert client.calls == [["one"], ["two"], ["three"]]
+    check = sqlite3.connect(str(tmp_path / "orphans.db"))
+    assert check.execute(
+        "SELECT epoch FROM _cashew_sleep_state "
+        "WHERE name='orphan_missing_cursor_v1'"
+    ).fetchone() == (3,)
+    check.close()
+    conn.close()
+
+
+def test_capped_orphan_phase_rotation_prevents_repair_starvation(tmp_path):
+    conn = _orphan_db(tmp_path)
+    vector = np.ones(4, dtype=np.float32).tobytes()
+    conn.execute("UPDATE thought_nodes SET id='missing', content='missing'")
+    conn.execute(
+        "INSERT INTO thought_nodes(id, content, timestamp) VALUES ('repair','repair','2')"
+    )
+    conn.execute(
+        "INSERT INTO embeddings VALUES ('repair', ?, 'm', datetime('now'))",
+        (vector,),
+    )
+    conn.commit()
+
+    class RejectOrdinary:
+        def __init__(self):
+            self.calls = []
+
+        def encode(self, texts):
+            self.calls.append(list(texts))
+            raise RuntimeError("synthetic worker rejection")
+
+    client = RejectOrdinary()
+    first_stats = {}
+    assert _embed_orphans(
+        conn, embedding_client=client, embedding_model="m", expected_dimension=4,
+        limit=1, batch_size=1, stats=first_stats,
+    ) == 0
+    assert first_stats["orphan_write_failed"] == 1
+    second_stats = {}
+    assert _embed_orphans(
+        conn, embedding_client=client, embedding_model="m", expected_dimension=4,
+        limit=1, batch_size=1, stats=second_stats,
+    ) == 1
+    assert client.calls == [["missing"]]
+    assert conn.execute(
+        "SELECT count(*) FROM vec_embeddings WHERE node_id='repair'"
+    ).fetchone() == (1,)
+    conn.close()
+
+
+def test_orphan_vec_failure_rolls_back_ordinary_row(tmp_path):
+    conn = _orphan_db(tmp_path)
+    conn.close()
+
+    class BrokenVecWrite(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            if sql.startswith("INSERT OR REPLACE INTO vec_embeddings"):
+                raise sqlite3.OperationalError("synthetic vec write failure")
+            return super().execute(sql, *args, **kwargs)
+
+    conn = sqlite3.connect(
+        str(tmp_path / "orphans.db"), factory=BrokenVecWrite,
+    )
     client = _Client(lambda n: np.ones((n, 4), dtype=np.float32))
     stats = {}
     assert (
@@ -638,30 +889,15 @@ def test_malformed_existing_embedding_is_contained(tmp_path):
 
 def test_real_sqlite_vec0_dual_write_when_extension_is_available(tmp_path):
     pytest.importorskip("sqlite_vec")
-    from core.embeddings import _load_vec
 
     conn = _orphan_db(tmp_path)
-    conn.execute("DROP TABLE vec_embeddings")
-    _load_vec(conn)
-    conn.execute(
-        "CREATE VIRTUAL TABLE vec_embeddings USING vec0("
-        "node_id text primary key, embedding float[4] distance_metric=cosine)"
-    )
-    conn.commit()
+    assert _vec_write_capability(conn) is True
     conn.close()
 
 
 def _real_vec_db(tmp_path: Path, name: str):
     pytest.importorskip("sqlite_vec")
-    from core.embeddings import _load_vec
     conn = _orphan_db(tmp_path)
-    conn.execute("DROP TABLE vec_embeddings")
-    _load_vec(conn)
-    conn.execute(
-        "CREATE VIRTUAL TABLE vec_embeddings USING vec0("
-        "node_id text primary key, embedding float[4] distance_metric=cosine)"
-    )
-    conn.commit()
     conn.close()
     return sqlite3.connect(str(tmp_path / "orphans.db"))
 
@@ -677,6 +913,29 @@ def test_vec_enable_failure_is_unavailable(tmp_path):
     disabled = sqlite3.connect(str(tmp_path / "orphans.db"), factory=Disabled)
     assert _vec_write_capability(disabled) is False
     disabled.close()
+
+
+def test_plain_table_named_vec_embeddings_is_not_vec_capability(tmp_path):
+    conn = _orphan_db(tmp_path, vec=False)
+    conn.execute(
+        "CREATE TABLE vec_embeddings(node_id TEXT PRIMARY KEY, embedding BLOB)"
+    )
+    conn.commit()
+    assert _vec_write_capability(conn) is False
+    stats = {}
+    assert _embed_orphans(
+        conn,
+        embedding_client=_Client(
+            lambda n: np.ones((n, 4), dtype=np.float32)
+        ),
+        embedding_model="m",
+        expected_dimension=4,
+        stats=stats,
+    ) == 0
+    assert stats["orphan_vec_unavailable"] == 1
+    assert conn.execute("SELECT count(*) FROM embeddings").fetchone() == (1,)
+    assert conn.execute("SELECT count(*) FROM vec_embeddings").fetchone() == (0,)
+    conn.close()
 
 
 def test_vec_post_load_query_failure_is_hard(tmp_path):
@@ -725,7 +984,7 @@ def test_public_cycle_reports_committed_prefix_when_later_phase_fails(tmp_path, 
 
 
 def test_early_orphan_commit_survives_candidate_discovery_failure(tmp_path, monkeypatch):
-    conn = _orphan_db(tmp_path)
+    conn = _orphan_db(tmp_path, dimension=384)
     vector = np.ones(384, dtype=np.float32).tobytes()
     conn.execute(
         "INSERT INTO embeddings VALUES ('anchor', ?, 'all-MiniLM-L6-v2', datetime('now'))",
@@ -953,6 +1212,73 @@ def test_sleep_state_malformed_schema_rebuilds_idempotently(tmp_path):
     conn.close()
 
 
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [
+            ("candidate_cursor_v1", "2026-01-01", "a", 1),
+            ("candidate_cursor_v1", "2026-01-02", "b", 2),
+        ],
+        [("candidate_cursor_v1", b"bad", "a", 1)],
+        [("candidate_cursor_v1", "2026-01-01", "a", -1)],
+    ],
+)
+def test_sleep_state_ambiguous_or_invalid_cursor_resets_to_origin(tmp_path, rows):
+    conn = sqlite3.connect(str(tmp_path / "state-reset.db"))
+    conn.execute(
+        "CREATE TABLE _cashew_sleep_state("
+        "name TEXT, cursor_timestamp TEXT, cursor_node_id TEXT, epoch)"
+    )
+    conn.executemany("INSERT INTO _cashew_sleep_state VALUES (?, ?, ?, ?)", rows)
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    _ensure_sleep_state_schema(conn)
+    conn.commit()
+    assert conn.execute(
+        "SELECT * FROM _cashew_sleep_state WHERE name='candidate_cursor_v1'"
+    ).fetchall() == []
+    conn.close()
+
+
+def test_sleep_state_exact_schema_drops_type_invalid_cursor(tmp_path):
+    conn = sqlite3.connect(str(tmp_path / "state-invalid.db"))
+    conn.execute(
+        "CREATE TABLE _cashew_sleep_state("
+        "name TEXT PRIMARY KEY, cursor_timestamp TEXT NOT NULL, "
+        "cursor_node_id TEXT NOT NULL, epoch INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO _cashew_sleep_state VALUES (?, ?, ?, ?)",
+        ("candidate_cursor_v1", sqlite3.Binary(b"bad"), "a", 1),
+    )
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    _ensure_sleep_state_schema(conn)
+    conn.commit()
+    assert conn.execute("SELECT * FROM _cashew_sleep_state").fetchall() == []
+    conn.close()
+
+
+def test_sleep_cursor_migration_is_atomic_under_writer_contention(tmp_path):
+    path = _cycle_db(tmp_path, "cursor-contention.db")
+    _add_four_fairness_nodes(path)
+    owner = sqlite3.connect(str(path))
+    contender = sqlite3.connect(str(path), timeout=0.0)
+    owner.execute("BEGIN IMMEDIATE")
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        _select_cycle_node_ids(contender, 2)
+    assert owner.execute(
+        "SELECT name FROM sqlite_master WHERE name='_cashew_sleep_state'"
+    ).fetchone() is None
+    owner.rollback()
+    assert _select_cycle_node_ids(contender, 2) == ["a", "b"]
+    assert contender.execute(
+        "SELECT name, epoch FROM _cashew_sleep_state"
+    ).fetchall() == [("candidate_cursor_v1", 1)]
+    contender.close()
+    owner.close()
+
+
 def test_synchronous_dream_reports_ran(tmp_path, monkeypatch):
     path = _cycle_db(tmp_path, "dream.db")
     conn = sqlite3.connect(str(path))
@@ -1015,7 +1341,7 @@ def test_repaired_half_pair_can_drive_dream(tmp_path, monkeypatch):
 
 
 def test_public_cycle_repairs_orphan_before_anchor_requirement(tmp_path):
-    conn = _orphan_db(tmp_path)
+    conn = _orphan_db(tmp_path, dimension=384)
     dimension = 384
     anchor = np.ones(dimension, dtype=np.float32).tobytes()
     conn.execute(
@@ -1041,6 +1367,8 @@ def test_public_cycle_repairs_orphan_before_anchor_requirement(tmp_path):
     assert result["nodes_selected"] == 2
     assert result["dedup_nodes_merged"] == 1
     check = sqlite3.connect(str(tmp_path / "orphans.db"))
+    from core.embeddings import _load_vec
+    _load_vec(check)
     assert check.execute("SELECT count(*) FROM vec_embeddings").fetchone()[0] == 1
     check.close()
 

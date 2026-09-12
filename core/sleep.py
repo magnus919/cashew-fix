@@ -209,6 +209,15 @@ def _load_embedding_matrix(
 
 
 _SLEEP_CURSOR_NAME = "candidate_cursor_v1"
+_ORPHAN_MISSING_CURSOR_NAME = "orphan_missing_cursor_v1"
+_ORPHAN_REPAIR_CURSOR_NAME = "orphan_repair_cursor_v1"
+_ORPHAN_PHASE_CURSOR_NAME = "orphan_phase_cursor_v1"
+_SLEEP_CURSOR_NAMES = {
+    _SLEEP_CURSOR_NAME,
+    _ORPHAN_MISSING_CURSOR_NAME,
+    _ORPHAN_REPAIR_CURSOR_NAME,
+    _ORPHAN_PHASE_CURSOR_NAME,
+}
 
 
 def _create_sleep_state_table(conn: sqlite3.Connection) -> None:
@@ -217,6 +226,18 @@ def _create_sleep_state_table(conn: sqlite3.Connection) -> None:
         "CREATE TABLE _cashew_sleep_state ("
         "name TEXT PRIMARY KEY, cursor_timestamp TEXT NOT NULL, "
         "cursor_node_id TEXT NOT NULL, epoch INTEGER NOT NULL)"
+    )
+
+
+def _valid_sleep_cursor_row(row: tuple) -> bool:
+    """Return whether one private cursor row has canonical SQLite types."""
+    return (
+        len(row) == 3
+        and isinstance(row[0], str)
+        and isinstance(row[1], str)
+        and isinstance(row[2], int)
+        and not isinstance(row[2], bool)
+        and row[2] >= 0
     )
 
 
@@ -246,32 +267,47 @@ def _ensure_sleep_state_schema(conn: sqlite3.Connection) -> None:
         ("epoch", "INTEGER", 1, 0),
     ]
     if shape == expected:
+        for name in sorted(_SLEEP_CURSOR_NAMES):
+            row = conn.execute(
+                "SELECT cursor_timestamp, cursor_node_id, epoch "
+                "FROM _cashew_sleep_state WHERE name=?",
+                (name,),
+            ).fetchone()
+            if row is not None and not _valid_sleep_cursor_row(row):
+                conn.execute(
+                    "DELETE FROM _cashew_sleep_state WHERE name=?", (name,)
+                )
         return
 
     columns = {row[1] for row in info}
-    saved = None
+    saved: List[Tuple[str, str, str, int]] = []
     cursor_columns = {"name", "cursor_timestamp", "cursor_node_id"}
     if cursor_columns.issubset(columns):
         epoch_expr = "epoch" if "epoch" in columns else "0"
-        row = conn.execute(
-            "SELECT cursor_timestamp, cursor_node_id, " + epoch_expr + " "
-            "FROM _cashew_sleep_state WHERE name=? LIMIT 1",
-            (_SLEEP_CURSOR_NAME,),
-        ).fetchone()
-        if row is not None and row[0] is not None and row[1] is not None:
-            try:
-                epoch = max(0, int(row[2]))
-            except (TypeError, ValueError, OverflowError):
-                epoch = 0
-            saved = (str(row[0]), str(row[1]), epoch)
+        for name in sorted(_SLEEP_CURSOR_NAMES):
+            rows = conn.execute(
+                "SELECT cursor_timestamp, cursor_node_id, " + epoch_expr + " "
+                "FROM _cashew_sleep_state WHERE name=?",
+                (name,),
+            ).fetchall()
+            # A malformed table may contain duplicate or type-confused rows.
+            # There is no canonical owner in that case, so reset this private
+            # cursor to its deterministic origin rather than preserving an
+            # arbitrary SQLite row.
+            if len(rows) != 1:
+                continue
+            if not _valid_sleep_cursor_row(rows[0]):
+                continue
+            timestamp, node_id, epoch_value = rows[0]
+            saved.append((name, timestamp, node_id, epoch_value))
 
     conn.execute("DROP TABLE _cashew_sleep_state")
     _create_sleep_state_table(conn)
-    if saved is not None:
-        conn.execute(
+    if saved:
+        conn.executemany(
             "INSERT INTO _cashew_sleep_state "
             "(name, cursor_timestamp, cursor_node_id, epoch) VALUES (?, ?, ?, ?)",
-            (_SLEEP_CURSOR_NAME, *saved),
+            saved,
         )
 
 
@@ -410,6 +446,7 @@ def _batch_cross_links(
     sim: np.ndarray,
     source_files: Optional[Dict[str, str]] = None,
     max_edges: Optional[int] = None,
+    progress: Optional[dict] = None,
 ) -> dict:
     """Insert cross-link pairs atomically, with pair-budget accounting.
 
@@ -429,10 +466,103 @@ def _batch_cross_links(
     t0 = time.perf_counter()
     dirty = False
     pending_dream_pairs: List[Tuple[str, str, float]] = []
+    pending_created = 0
+    pending_repaired = 0
+    pending_directed_rows = 0
+    pending_pairs: List[Tuple[str, str, bool]] = []
+
+    def publish_progress(*, uncertain: bool = False) -> None:
+        if progress is None:
+            return
+        progress.update({
+            "cross_links_created": stats["created"],
+            "cross_links_repaired": stats["repaired"],
+            "cross_links_skipped": stats["skipped"],
+            "cross_link_directed_rows": stats["directed_rows"],
+            "cross_link_same_source_skipped": stats["same_source_skipped"],
+            "cross_link_capped": stats["capped"],
+        })
+        if uncertain:
+            progress["_outcome_uncertain"] = True
+
+    def apply_pending() -> None:
+        nonlocal dirty, pending_created, pending_repaired, pending_directed_rows
+        if not dirty:
+            return
+        stats["created"] += pending_created
+        stats["repaired"] += pending_repaired
+        stats["directed_rows"] += pending_directed_rows
+        stats["dream_pairs"].extend(pending_dream_pairs)
+        pending_dream_pairs.clear()
+        pending_pairs.clear()
+        pending_created = 0
+        pending_repaired = 0
+        pending_directed_rows = 0
+        dirty = False
+        publish_progress()
+
+    def commit_pending() -> bool:
+        if not dirty:
+            return True
+        try:
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            # Verify the attempted transaction after rollback.  SQLite commit
+            # errors normally leave every pending pair at its original shape;
+            # a wrapper can also raise after a successful commit.  Only those
+            # two all-or-nothing outcomes are knowable.  A failed verification
+            # or mixed state is genuinely uncertain and must not invent public
+            # counters or dream inputs.
+            try:
+                final_counts = []
+                for n1, n2, _was_repair in pending_pairs:
+                    final_counts.append(conn.execute(
+                        "SELECT count(*) FROM derivation_edges "
+                        "WHERE (parent_id=? AND child_id=?) OR "
+                        "(parent_id=? AND child_id=?)",
+                        (n1, n2, n2, n1),
+                    ).fetchone()[0])
+            except Exception:
+                publish_progress(uncertain=True)
+                raise
+            original_counts = [1 if repaired else 0 for _, _, repaired in pending_pairs]
+            if final_counts == [2] * len(pending_pairs):
+                apply_pending()
+            elif final_counts != original_counts:
+                publish_progress(uncertain=True)
+                raise
+            else:
+                pending_dream_pairs.clear()
+                pending_pairs.clear()
+                # The whole attempted transaction rolled back.  The already
+                # committed prefix remains exact and the failed suffix does
+                # not contribute to pair or directed-row counters.
+                nonlocal_reset_pending()
+                publish_progress()
+            stats["failed"] += 1
+            return False
+        apply_pending()
+        return True
+
+    def nonlocal_reset_pending() -> None:
+        nonlocal dirty, pending_created, pending_repaired, pending_directed_rows
+        pending_created = 0
+        pending_repaired = 0
+        pending_directed_rows = 0
+        dirty = False
+
     for pair_no, (i, j) in enumerate(cross_pairs):
-        budget = stats["created"] + stats["repaired"]
+        budget = (
+            stats["created"] + stats["repaired"]
+            + pending_created + pending_repaired
+        )
         if max_edges is not None and budget >= max_edges:
             stats["capped"] = True
+            publish_progress()
             break
         n1, n2 = ids[int(i)], ids[int(j)]
         if source_files is not None:
@@ -451,7 +581,10 @@ def _batch_cross_links(
         missing = [(n1, n2), (n2, n1)]
         missing = [(p, c) for p, c in missing if (p, c) not in present]
         name = f"cross_pair_{pair_no}"
+        started_batch = not dirty
         try:
+            if started_batch:
+                conn.execute("BEGIN IMMEDIATE")
             conn.execute(f"SAVEPOINT {name}")
             weight = float(sim[int(i), int(j)])
             conn.executemany(
@@ -475,23 +608,27 @@ def _batch_cross_links(
                 conn.execute(f"RELEASE SAVEPOINT {name}")
             except sqlite3.Error:
                 pass
+            if started_batch:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
             stats["failed"] += 1
             logger.warning("sleep: cross-link pair failed: %s", type(exc).__name__)
             continue
         if len(present) == 1:
-            stats["repaired"] += 1
+            pending_repaired += 1
         else:
-            stats["created"] += 1
-        stats["directed_rows"] += len(missing)
+            pending_created += 1
+        pending_directed_rows += len(missing)
         pending_dream_pairs.append((n1, n2, weight))
+        pending_pairs.append((n1, n2, len(present) == 1))
         if dirty and len(pending_dream_pairs) >= EDGES_PER_BATCH:
-            conn.commit()
-            stats["dream_pairs"].extend(pending_dream_pairs)
-            pending_dream_pairs.clear()
-            dirty = False
+            if not commit_pending():
+                break
     if dirty:
-        conn.commit()
-        stats["dream_pairs"].extend(pending_dream_pairs)
+        commit_pending()
+    publish_progress()
     elapsed = time.perf_counter() - t0
     logger.info(
         "sleep: cross-links %d created, %d repaired, %d skipped in %.1fs",
@@ -998,8 +1135,11 @@ def _vec_write_capability(conn: sqlite3.Connection) -> bool:
     if not row:
         return False
     ddl = (row[0] or "").lower()
-    if "using vec0" not in ddl:
-        return True
+    if (
+        re.match(r"\s*create\s+virtual\s+table\b", ddl) is None
+        or re.search(r"\busing\s+vec0\s*\(", ddl) is None
+    ):
+        return False
     try:
         import sqlite_vec
     except ImportError:
@@ -1020,6 +1160,127 @@ def _vec_write_capability(conn: sqlite3.Connection) -> bool:
             conn.enable_load_extension(False)
         except sqlite3.Error:
             pass
+
+
+def _claim_orphan_phase_order(
+    conn: sqlite3.Connection, *, capped: bool, vec_available: bool,
+) -> Tuple[str, ...]:
+    """Alternate capped ordinary and vec-repair admission across cycles."""
+    if not capped or not vec_available:
+        return ("ordinary", "repair") if vec_available else ("ordinary",)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _ensure_sleep_state_schema(conn)
+        row = conn.execute(
+            "SELECT epoch FROM _cashew_sleep_state WHERE name=?",
+            (_ORPHAN_PHASE_CURSOR_NAME,),
+        ).fetchone()
+        try:
+            epoch = int(row[0]) if row is not None else 0
+        except (TypeError, ValueError, OverflowError):
+            epoch = 0
+        epoch = max(0, epoch)
+        conn.execute(
+            "INSERT OR REPLACE INTO _cashew_sleep_state "
+            "(name, cursor_timestamp, cursor_node_id, epoch) VALUES (?, '', '', ?)",
+            (_ORPHAN_PHASE_CURSOR_NAME, epoch + 1),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return ("ordinary", "repair") if epoch % 2 == 0 else ("repair", "ordinary")
+
+
+def _select_orphan_page(
+    conn: sqlite3.Connection,
+    *,
+    kind: str,
+    take: int,
+    timestamp_expr: str,
+    embedding_columns: Set[str],
+) -> Tuple[List[tuple], bool]:
+    """Claim one durable capped orphan page before inference or DML.
+
+    The boolean is true at a deterministic ordering boundary.  Callers stop
+    this phase there so a short tail is not immediately followed by the same
+    oldest failing rows in one cycle.
+    """
+    if kind == "ordinary":
+        state_name = _ORPHAN_MISSING_CURSOR_NAME
+        select = f"SELECT tn.id, tn.content, {timestamp_expr} "
+        source = (
+            "FROM thought_nodes tn "
+            "LEFT JOIN embeddings e ON tn.id = e.node_id "
+            "WHERE e.node_id IS NULL AND (tn.decayed IS NULL OR tn.decayed = 0) "
+            "AND tn.content IS NOT NULL AND TRIM(tn.content) != '' "
+        )
+        id_expr = "tn.id"
+    elif kind == "repair":
+        state_name = _ORPHAN_REPAIR_CURSOR_NAME
+        select = (
+            "SELECT e.node_id, e.vector, "
+            + ("COALESCE(e.model, '')" if "model" in embedding_columns else "''")
+            + f", {timestamp_expr} "
+        )
+        source = (
+            "FROM embeddings e "
+            "LEFT JOIN vec_embeddings v ON v.node_id=e.node_id "
+            "JOIN thought_nodes tn ON tn.id=e.node_id "
+            "WHERE v.node_id IS NULL AND (tn.decayed IS NULL OR tn.decayed=0) "
+        )
+        id_expr = "e.node_id"
+    else:
+        raise ValueError("invalid_orphan_phase")
+
+    order = f"ORDER BY {timestamp_expr}, {id_expr} LIMIT ?"
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _ensure_sleep_state_schema(conn)
+        state = conn.execute(
+            "SELECT cursor_timestamp, cursor_node_id, epoch "
+            "FROM _cashew_sleep_state WHERE name=?",
+            (state_name,),
+        ).fetchone()
+        rows: List[tuple] = []
+        wrapped = False
+        epoch = 0
+        if (
+            state is not None
+            and isinstance(state[0], str)
+            and isinstance(state[1], str)
+        ):
+            cursor_timestamp, cursor_node_id, epoch_value = state
+            try:
+                epoch = max(0, int(epoch_value))
+            except (TypeError, ValueError, OverflowError):
+                epoch = 0
+            rows = conn.execute(
+                select
+                + source
+                + f"AND ({timestamp_expr} > ? OR "
+                + f"({timestamp_expr} = ? AND {id_expr} > ?)) "
+                + order,
+                (cursor_timestamp, cursor_timestamp, cursor_node_id, take),
+            ).fetchall()
+            if not rows:
+                wrapped = True
+                rows = conn.execute(select + source + order, (take,)).fetchall()
+        else:
+            rows = conn.execute(select + source + order, (take,)).fetchall()
+        if rows:
+            last_id = rows[-1][0]
+            last_timestamp = rows[-1][-1]
+            conn.execute(
+                "INSERT OR REPLACE INTO _cashew_sleep_state "
+                "(name, cursor_timestamp, cursor_node_id, epoch) VALUES (?, ?, ?, ?)",
+                (state_name, last_timestamp, last_id, epoch + 1),
+            )
+        conn.commit()
+        return rows, wrapped or len(rows) < take
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _embed_orphans(
@@ -1167,8 +1428,15 @@ def _embed_orphans(
         return True
 
     ordinary_cursor: Optional[Tuple[str, str]] = None
-    while remaining is None or remaining > 0:
-        take = batch_size if remaining is None else min(batch_size, remaining)
+    repair_cursor: Optional[Tuple[str, str]] = None
+
+    def ordinary_page(take: int) -> Tuple[List[tuple], bool]:
+        nonlocal ordinary_cursor
+        if limit is not None:
+            return _select_orphan_page(
+                conn, kind="ordinary", take=take,
+                timestamp_expr=timestamp_expr, embedding_columns=columns,
+            )
         cursor_sql = ""
         params: List[object] = []
         if ordinary_cursor is not None:
@@ -1189,40 +1457,19 @@ def _embed_orphans(
             + f"ORDER BY {timestamp_expr}, tn.id LIMIT ?",
             params,
         ).fetchall()
-        if not rows:
-            break
-        stats["orphan_examined"] += len(rows)
-        if remaining is not None:
-            remaining -= len(rows)
-        ordinary_cursor = (rows[-1][2], rows[-1][0])
-        try:
-            raw = embedding_client.encode([content for _, content, _ in rows])
-            array = np.asarray(raw)
-            if array.shape != (len(rows), expected):
-                raise ValueError("embedding_shape_mismatch")
-            vectors = [np.asarray(item, dtype=np.float32) for item in array]
-            if any(
-                not np.all(np.isfinite(vec)) or np.allclose(vec, 0)
-                for vec in vectors
-            ):
-                raise ValueError("embedding_invalid")
-        except Exception as exc:
-            logger.warning(
-                "sleep: orphan embedding batch rejected: %s", type(exc).__name__
-            )
-            stats["orphan_write_failed"] += len(rows)
-            break
-        if not commit_batch([
-            (nid, vec.tobytes(), str(embedding_model))
-            for (nid, _content, _timestamp), vec in zip(rows, vectors)
-        ]):
-            break
+        if rows:
+            ordinary_cursor = (rows[-1][2], rows[-1][0])
+        return rows, False
 
-    repair_cursor: Optional[Tuple[str, str]] = None
-    while vec_available and (remaining is None or remaining > 0):
-        take = batch_size if remaining is None else min(batch_size, remaining)
+    def repair_page(take: int) -> Tuple[List[tuple], bool]:
+        nonlocal repair_cursor
+        if limit is not None:
+            return _select_orphan_page(
+                conn, kind="repair", take=take,
+                timestamp_expr=timestamp_expr, embedding_columns=columns,
+            )
         cursor_sql = ""
-        params = []
+        params: List[object] = []
         if repair_cursor is not None:
             cursor_sql = (
                 f"AND ({timestamp_expr} > ? OR "
@@ -1230,7 +1477,7 @@ def _embed_orphans(
             )
             params.extend([repair_cursor[0], repair_cursor[0], repair_cursor[1]])
         params.append(take)
-        repair_rows = conn.execute(
+        rows = conn.execute(
             "SELECT e.node_id, e.vector, "
             + ("COALESCE(e.model, '')" if "model" in columns else "''")
             + f", {timestamp_expr} FROM embeddings e "
@@ -1241,27 +1488,77 @@ def _embed_orphans(
             + f"ORDER BY {timestamp_expr}, e.node_id LIMIT ?",
             params,
         ).fetchall()
-        if not repair_rows:
-            break
-        stats["orphan_examined"] += len(repair_rows)
-        if remaining is not None:
-            remaining -= len(repair_rows)
-        repair_cursor = (repair_rows[-1][3], repair_rows[-1][0])
-        items: List[Tuple[str, bytes, str]] = []
-        for nid, blob, stored_model, _timestamp in repair_rows:
-            try:
-                vec = np.frombuffer(blob, dtype=np.float32)
-                if embedding_model and stored_model and stored_model != embedding_model:
-                    raise ValueError("embedding_model_mismatch")
-                if (len(vec) != expected or not np.all(np.isfinite(vec))
-                        or np.allclose(vec, 0)):
-                    raise ValueError("embedding_invalid")
-            except (TypeError, ValueError, BufferError):
-                stats["orphan_write_failed"] += 1
-                continue
-            items.append((nid, bytes(blob), stored_model or str(embedding_model)))
-        if not commit_batch(items):
-            break
+        if rows:
+            repair_cursor = (rows[-1][3], rows[-1][0])
+        return rows, False
+
+    phase_order = _claim_orphan_phase_order(
+        conn, capped=limit is not None, vec_available=vec_available,
+    )
+    for phase in phase_order:
+        while remaining is None or remaining > 0:
+            take = batch_size if remaining is None else min(batch_size, remaining)
+            if phase == "ordinary":
+                rows, at_boundary = ordinary_page(take)
+                if not rows:
+                    break
+                stats["orphan_examined"] += len(rows)
+                if remaining is not None:
+                    remaining -= len(rows)
+                try:
+                    raw = embedding_client.encode([content for _, content, _ in rows])
+                    array = np.asarray(raw)
+                    if array.shape != (len(rows), expected):
+                        raise ValueError("embedding_shape_mismatch")
+                    vectors = [np.asarray(item, dtype=np.float32) for item in array]
+                    if any(
+                        not np.all(np.isfinite(vec)) or np.allclose(vec, 0)
+                        for vec in vectors
+                    ):
+                        raise ValueError("embedding_invalid")
+                except Exception as exc:
+                    logger.warning(
+                        "sleep: orphan embedding batch rejected: %s",
+                        type(exc).__name__,
+                    )
+                    stats["orphan_write_failed"] += len(rows)
+                    break
+                if not commit_batch([
+                    (nid, vec.tobytes(), str(embedding_model))
+                    for (nid, _content, _timestamp), vec in zip(rows, vectors)
+                ]):
+                    break
+            else:
+                rows, at_boundary = repair_page(take)
+                if not rows:
+                    break
+                stats["orphan_examined"] += len(rows)
+                if remaining is not None:
+                    remaining -= len(rows)
+                items: List[Tuple[str, bytes, str]] = []
+                for nid, blob, stored_model, _timestamp in rows:
+                    try:
+                        vec = np.frombuffer(blob, dtype=np.float32)
+                        if (
+                            embedding_model
+                            and stored_model
+                            and stored_model != embedding_model
+                        ):
+                            raise ValueError("embedding_model_mismatch")
+                        if (
+                            len(vec) != expected
+                            or not np.all(np.isfinite(vec))
+                            or np.allclose(vec, 0)
+                        ):
+                            raise ValueError("embedding_invalid")
+                    except (TypeError, ValueError, BufferError):
+                        stats["orphan_write_failed"] += 1
+                        continue
+                    items.append((nid, bytes(blob), stored_model or str(embedding_model)))
+                if not commit_batch(items):
+                    break
+            if at_boundary:
+                break
 
     logger.info("sleep: embedded/repaired %d orphaned nodes", embedded)
     return embedded
@@ -1538,10 +1835,17 @@ def run_sleep_cycle(
         cross_stats = {"created": 0, "skipped": 0}
         cross_link_tuples: List[Tuple[str, str, float]] = []
         if len(cross_pairs) > 0:
+            progress.update({
+                "nodes_selected": len(ids),
+                "nodes_with_embeddings": len(valid_ids),
+                "cross_link_candidates": len(cross_pairs),
+                "dedup_candidates": len(dedup_pairs),
+            })
             cross_stats = _batch_cross_links(
                 conn, valid_ids, cross_pairs, sim,
                 source_files=source_files if cross_source_only else None,
                 max_edges=max_edges,
+                progress=progress,
             )
             if model_fn is not None:
                 cross_link_tuples = list(cross_stats.get("dream_pairs", ()))
@@ -1765,6 +2069,11 @@ def run_sleep_cycle(
 
     except Exception as exc:
         logger.warning("sleep: cycle failed: %s", type(exc).__name__)
+        if progress.get("_outcome_uncertain"):
+            progress["status"] = "uncertain"
+            progress["error"] = "cross_link_commit_uncertain"
+            progress["elapsed_s"] = round(time.perf_counter() - t_start, 1)
+            return _public_sleep_result(progress)
         persisted = progress.get("cross_links_created", 0) + progress.get(
             "cross_links_repaired", 0
         ) + progress.get("dedup_nodes_merged", 0) + progress.get(
