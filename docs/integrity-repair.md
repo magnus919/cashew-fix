@@ -37,6 +37,8 @@ bounded pass, including work beyond `batch_size` or `max_items`.  Commit
 uncertainty cannot be determined by this API because commit
 belongs to the caller; adapters should report it as `uncertain` and preserve
 their backup when their own commit or postcondition check is ambiguous.
+If a savepoint rollback itself fails, the result sets `mutated: true`,
+`mutation_uncertain: true`, and records `savepoint_rollback_failed`.
 
 ## Safe repair boundary
 
@@ -58,6 +60,9 @@ float32 parity with the ordinary embedding.  A missing, unloadable, or
 dimension-incompatible vec table is reported as unavailable when parity is
 required.  An ordinary-only repair may opt out with
 `require_vec_parity=False`.
+When an embedding model is supplied, a vec replacement may copy only an
+ordinary embedding carrying that exact model; otherwise the row remains
+skipped for the caller's model-specific repair path.
 
 Permanence contradictions and self-edges are report-only by default.  A
 caller must explicitly request `permanence_policy="preserve_permanent"` or

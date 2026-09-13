@@ -445,6 +445,45 @@ def test_real_vec_invalid_and_mismatched_rows_are_replaced(tmp_path: Path) -> No
     conn.close()
 
 
+def test_real_vec_repair_does_not_copy_old_model_vector(tmp_path: Path) -> None:
+    sqlite_vec = pytest.importorskip("sqlite_vec")
+    conn = _create_db(tmp_path / "vec-old-model.db")
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
+    conn.execute(
+        "CREATE VIRTUAL TABLE vec_embeddings USING vec0("
+        "node_id TEXT PRIMARY KEY, embedding float[4] distance_metric=cosine)"
+    )
+    _add_node(conn, "old")
+    ordinary = _blob([1.0, 0.0, 0.0, 0.0])
+    conn.execute(
+        "INSERT INTO embeddings VALUES ('old', ?, 'old-model', 'now')", (ordinary,)
+    )
+    conn.execute(
+        "INSERT INTO vec_embeddings VALUES ('old', ?)",
+        (_blob([0.0, 0.0, 0.0, 0.0]),),
+    )
+    conn.commit()
+    conn.execute("BEGIN")
+
+    result = repair_integrity(
+        conn,
+        expected_dimension=4,
+        embedding_model="new-model",
+        actions={"repair_vec"},
+    )
+
+    assert result["status"] == "partial"
+    assert result["skipped"]["embedding_model_mismatch"] == 1
+    assert result["remaining"]["invalid_vec"] == 1
+    assert conn.execute(
+        "SELECT embedding FROM vec_embeddings WHERE node_id='old'"
+    ).fetchone() == (_blob([0.0, 0.0, 0.0, 0.0]),)
+    conn.rollback()
+    conn.close()
+
+
 def test_bounded_repairs_report_remaining_work(tmp_path: Path) -> None:
     conn = _create_db(tmp_path / "bounded.db")
     for node_id in ("a", "b", "c"):
@@ -501,6 +540,40 @@ def test_release_failure_is_structured_and_savepoint_is_rolled_back(
     assert result["failures"]["savepoint_release_failed"] == 1
     assert result["repairs"]["orphan_embeddings_removed"] == 0
     assert conn.execute("SELECT COUNT(*) FROM embeddings").fetchone() == (1,)
+    conn.rollback()
+    conn.close()
+
+
+def test_rollback_failure_reports_mutation_uncertainty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = _create_db(tmp_path / "rollback-uncertain.db")
+    conn.execute(
+        "INSERT INTO embeddings VALUES ('ghost', ?, 'model-a', 'now')",
+        (_blob([1.0, 0.0, 0.0, 0.0]),),
+    )
+    conn.commit()
+    conn.execute("BEGIN")
+
+    def fail_release(_conn, _name):
+        raise sqlite3.OperationalError("synthetic release failure")
+
+    def fail_rollback(_conn, _name):
+        raise sqlite3.OperationalError("synthetic rollback failure")
+
+    monkeypatch.setattr(integrity, "_release_savepoint", fail_release)
+    monkeypatch.setattr(integrity, "_rollback_savepoint", fail_rollback)
+    result = repair_integrity(
+        conn,
+        require_vec_parity=False,
+        actions={"remove_orphan_embeddings"},
+    )
+
+    assert result["status"] == "partial"
+    assert result["mutated"] is True
+    assert result["mutation_uncertain"] is True
+    assert result["failures"]["savepoint_release_failed"] == 1
+    assert result["failures"]["savepoint_rollback_failed"] == 1
     conn.rollback()
     conn.close()
 

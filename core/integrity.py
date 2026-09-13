@@ -169,6 +169,7 @@ def _base_report(
         "transaction_owner": "caller",
         "committed": False,
         "mutated": False,
+        "mutation_uncertain": False,
         "expected_model": expected_model,
         "expected_dimension": expected_dimension,
         "vec": {
@@ -573,6 +574,8 @@ def repair_integrity(
                 _rollback_savepoint(conn, name)
             except (OSError, RuntimeError, sqlite3.Error, TypeError, ValueError):
                 _record(failures, "savepoint_rollback_failed")
+                report["mutated"] = True
+                report["mutation_uncertain"] = True
             _record(failures, type(exc).__name__)
             return False
         try:
@@ -584,6 +587,8 @@ def repair_integrity(
                 _rollback_savepoint(conn, name)
             except (OSError, RuntimeError, sqlite3.Error, TypeError, ValueError):
                 _record(failures, "savepoint_rollback_failed")
+                report["mutated"] = True
+                report["mutation_uncertain"] = True
             return False
         report["mutated"] = True
         return True
@@ -657,14 +662,14 @@ def repair_integrity(
 
     if vec_operational and "repair_vec" in selected:
         rows = conn.execute(
-            "SELECT v.node_id, v.embedding, e.vector, n.decayed "
+            "SELECT v.node_id, v.embedding, e.vector, e.model, n.decayed "
             "FROM vec_embeddings v "
             "LEFT JOIN embeddings e ON e.node_id=v.node_id "
             "LEFT JOIN thought_nodes n ON n.id=v.node_id "
             "ORDER BY v.node_id LIMIT ?",
             (min(batch_size, max_items),),
         ).fetchall()
-        for node_id, vector, ordinary, decayed in rows:
+        for node_id, vector, ordinary, ordinary_model, decayed in rows:
             if not item_budget():
                 break
             vector_reason = _decode_vector(vector, vec_dimension)
@@ -674,6 +679,7 @@ def repair_integrity(
                 else "embedding_missing"
             )
             stale = node_id is None or ordinary is None or decayed not in (None, 0)
+            model_compatible = embedding_model is None or ordinary_model == embedding_model
             mismatched = (
                 not stale
                 and vector_reason is None
@@ -682,6 +688,9 @@ def repair_integrity(
             )
             invalid = vector_reason is not None or mismatched
             if not stale and not invalid:
+                continue
+            if invalid and not model_compatible:
+                _record(skipped, "embedding_model_mismatch")
                 continue
             replacement = (
                 ordinary
