@@ -18,6 +18,11 @@ lock.  The caller owns:
 4. the outer transaction and final commit; and
 5. the post-repair verification audit.
 
+`repair_integrity` also requires the caller to have begun an outer
+transaction.  It returns `status: "rejected"` with
+`reason: "outer_transaction_required"` when `conn.in_transaction` is false;
+the caller must explicitly begin the transaction before invoking it.
+
 Each individual repair uses a savepoint.  A failed savepoint is rolled back
 without discarding unrelated work in the caller's transaction.  A successful
 repair is still uncommitted until the caller commits.  This is deliberate:
@@ -27,7 +32,9 @@ for recovery rather than having Cashew silently overwrite the live profile.
 The result contains `transaction_owner: "caller"` and `committed: false`.
 `completed` means that all selected work completed within the bound;
 `partial` means that a repair was skipped or failed and the caller must audit
-again.  Commit uncertainty cannot be determined by this API because commit
+again.  The `remaining` mapping records actionable anomalies left after the
+bounded pass, including work beyond `batch_size` or `max_items`.  Commit
+uncertainty cannot be determined by this API because commit
 belongs to the caller; adapters should report it as `uncertain` and preserve
 their backup when their own commit or postcondition check is ambiguous.
 
@@ -45,9 +52,11 @@ Work is capped by `max_items` and each query is limited by `batch_size`.
 Repeating the operation after a successful commit is safe and normally
 returns zero additional repairs.
 
-The vec table is never created, dropped, or recreated by this API.  A missing,
-unloadable, or dimension-incompatible vec table is reported as unavailable
-when parity is required.  An ordinary-only repair may opt out with
+The vec table is never created, dropped, or recreated by this API.  Existing
+vec rows are checked for schema dimension, finite/nonzero values, and exact
+float32 parity with the ordinary embedding.  A missing, unloadable, or
+dimension-incompatible vec table is reported as unavailable when parity is
+required.  An ordinary-only repair may opt out with
 `require_vec_parity=False`.
 
 Permanence contradictions and self-edges are report-only by default.  A

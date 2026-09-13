@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import core.integrity as integrity
 from core.integrity import inspect_integrity, repair_integrity
 
 
@@ -114,6 +115,7 @@ def test_orphan_repairs_preserve_outer_transaction_and_are_idempotent(
 
     conn = sqlite3.connect(path)
     # Recreate and commit the repair, then prove a second pass is a no-op.
+    conn.execute("BEGIN")
     second = repair_integrity(
         conn,
         embedding_model="model-a",
@@ -123,6 +125,7 @@ def test_orphan_repairs_preserve_outer_transaction_and_are_idempotent(
     conn.commit()
     assert second["repairs"]["orphan_embeddings_removed"] == 1
     assert second["repairs"]["orphan_edges_removed"] == 1
+    conn.execute("BEGIN")
     again = repair_integrity(
         conn,
         embedding_model="model-a",
@@ -150,6 +153,7 @@ def test_embedding_output_validation_does_not_write_invalid_pairs(
     conn = _create_db(tmp_path / f"invalid-{reason}.db")
     _add_node(conn, "n1", "repair me")
     conn.commit()
+    conn.execute("BEGIN")
 
     result = repair_integrity(
         conn,
@@ -178,6 +182,7 @@ def test_model_mismatch_and_missing_embedding_are_repaired_from_current_content(
         (_blob([1.0, 0.0, 0.0, 0.0]),),
     )
     conn.commit()
+    conn.execute("BEGIN")
     seen: list[str] = []
 
     def embed(texts):
@@ -211,6 +216,7 @@ def test_savepoint_rollback_keeps_other_repairs_and_reports_failure(tmp_path: Pa
         "WHEN NEW.node_id='bad' BEGIN SELECT RAISE(ABORT, 'reject bad'); END"
     )
     conn.commit()
+    conn.execute("BEGIN")
 
     result = repair_integrity(
         conn,
@@ -241,6 +247,7 @@ def test_ambiguous_permanence_and_self_edges_are_report_only_by_default(
         "INSERT INTO derivation_edges VALUES ('n1', 'n1', 1.0, 'self', 'now')"
     )
     conn.commit()
+    conn.execute("BEGIN")
 
     report = repair_integrity(conn, actions=set(), expected_dimension=4)
     assert report["status"] == "completed"
@@ -280,6 +287,7 @@ def test_invalid_arguments_and_schema_states_are_explicit(tmp_path: Path) -> Non
     deceptive = _create_db(tmp_path / "deceptive.db")
     deceptive.execute("CREATE TABLE vec_embeddings (node_id TEXT, embedding BLOB)")
     deceptive.commit()
+    deceptive.execute("BEGIN")
     result = repair_integrity(deceptive, actions={"repair_vec"})
     assert result["status"] == "partial"
     assert "vec_schema_invalid" in result["reasons"]
@@ -327,4 +335,185 @@ def test_real_vec_repairs_are_atomic_when_available(tmp_path: Path) -> None:
     assert conn.execute("SELECT node_id FROM vec_embeddings ORDER BY node_id").fetchall() == [
         ("stale",),
     ]
+    conn.close()
+
+
+def test_null_orphans_are_deleted_by_rowid(tmp_path: Path) -> None:
+    conn = _create_db(tmp_path / "null-orphans.db")
+    _add_node(conn, "live")
+    blob = _blob([1.0, 0.0, 0.0, 0.0])
+    conn.execute(
+        "INSERT INTO embeddings (node_id, vector, model, updated_at) "
+        "VALUES (NULL, ?, 'model-a', 'now')",
+        (blob,),
+    )
+    conn.execute(
+        "INSERT INTO derivation_edges VALUES (NULL, 'live', 1.0, 'bad', 'now')"
+    )
+    conn.commit()
+    conn.execute("BEGIN")
+
+    result = repair_integrity(
+        conn,
+        require_vec_parity=False,
+        actions={"remove_orphan_embeddings", "remove_orphan_edges"},
+    )
+
+    assert result["status"] == "completed"
+    assert result["repairs"]["orphan_embeddings_removed"] == 1
+    assert result["repairs"]["orphan_edges_removed"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM embeddings").fetchone() == (0,)
+    assert conn.execute("SELECT COUNT(*) FROM derivation_edges").fetchone() == (0,)
+    conn.rollback()
+    conn.close()
+
+
+def test_inventory_embeddings_do_not_make_healthy_status_findings(
+    tmp_path: Path,
+) -> None:
+    conn = _create_db(tmp_path / "healthy.db")
+    _add_node(conn, "live")
+    conn.execute(
+        "INSERT INTO embeddings VALUES ('live', ?, 'model-a', 'now')",
+        (_blob([1.0, 0.0, 0.0, 0.0]),),
+    )
+    conn.commit()
+
+    report = inspect_integrity(conn, expected_model="model-a", expected_dimension=4)
+
+    assert report["counts"]["embeddings"] == 1
+    assert report["status"] == "ok"
+    conn.close()
+
+
+def test_real_vec_invalid_and_mismatched_rows_are_replaced(tmp_path: Path) -> None:
+    sqlite_vec = pytest.importorskip("sqlite_vec")
+    conn = _create_db(tmp_path / "vec-invalid.db")
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
+    conn.execute(
+        "CREATE VIRTUAL TABLE vec_embeddings USING vec0("
+        "node_id TEXT PRIMARY KEY, embedding float[4] distance_metric=cosine)"
+    )
+    ordinary = _blob([1.0, 0.0, 0.0, 0.0])
+    for node_id in ("zero", "nan", "mismatch"):
+        _add_node(conn, node_id)
+        conn.execute(
+            "INSERT INTO embeddings VALUES (?, ?, 'model-a', 'now')",
+            (node_id, ordinary),
+        )
+    conn.execute(
+        "INSERT INTO vec_embeddings VALUES ('zero', ?)",
+        (_blob([0.0, 0.0, 0.0, 0.0]),),
+    )
+    conn.execute(
+        "INSERT INTO vec_embeddings VALUES ('nan', ?)",
+        (struct.pack("<4f", float("nan"), 0.0, 0.0, 0.0),),
+    )
+    conn.execute(
+        "INSERT INTO vec_embeddings VALUES ('mismatch', ?)",
+        (_blob([0.0, 1.0, 0.0, 0.0]),),
+    )
+    conn.commit()
+    before = inspect_integrity(conn, expected_dimension=4)
+    assert before["counts"]["invalid_vec"] == 2
+    assert before["counts"]["vec_mismatched"] == 1
+    assert before["reasons_by_kind"]["vec_embedding_zero_norm"] == 1
+    assert before["reasons_by_kind"]["vec_embedding_nonfinite"] == 1
+    assert before["reasons_by_kind"]["vec_value_mismatch"] == 1
+    wrong_schema_dimension = inspect_integrity(conn, expected_dimension=3)
+    assert wrong_schema_dimension["counts"]["invalid_vec"] >= 1
+    assert "vec_dimension_mismatch" in wrong_schema_dimension["reasons"]
+    conn.execute("BEGIN")
+
+    result = repair_integrity(
+        conn,
+        expected_dimension=4,
+        embedding_model="model-a",
+        actions={"repair_vec"},
+        batch_size=10,
+    )
+
+    assert result["status"] == "completed"
+    assert result["repairs"]["vec_rows_inserted"] == 3
+    assert result["remaining"] == {}
+    assert conn.execute(
+        "SELECT node_id, embedding FROM vec_embeddings ORDER BY node_id"
+    ).fetchall() == [(node_id, ordinary) for node_id in ("mismatch", "nan", "zero")]
+    conn.rollback()
+    conn.close()
+
+
+def test_bounded_repairs_report_remaining_work(tmp_path: Path) -> None:
+    conn = _create_db(tmp_path / "bounded.db")
+    for node_id in ("a", "b", "c"):
+        _add_node(conn, node_id)
+        conn.execute(
+            "INSERT INTO embeddings VALUES (?, ?, 'model-a', 'now')",
+            (f"ghost-{node_id}", _blob([1.0, 0.0, 0.0, 0.0])),
+        )
+        conn.execute(
+            "INSERT INTO derivation_edges VALUES (?, ?, 1.0, 'bad', 'now')",
+            (f"ghost-{node_id}", node_id),
+        )
+    conn.commit()
+    conn.execute("BEGIN")
+
+    result = repair_integrity(
+        conn,
+        require_vec_parity=False,
+        actions={"remove_orphan_embeddings", "remove_orphan_edges"},
+        batch_size=10,
+        max_items=1,
+    )
+
+    assert result["status"] == "partial"
+    assert result["limits"]["items_considered"] == 2
+    assert result["remaining"]["orphan_embeddings"] == 2
+    assert result["remaining"]["orphan_edges"] == 3
+    conn.rollback()
+    conn.close()
+
+
+def test_release_failure_is_structured_and_savepoint_is_rolled_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = _create_db(tmp_path / "release-failure.db")
+    conn.execute(
+        "INSERT INTO embeddings VALUES ('ghost', ?, 'model-a', 'now')",
+        (_blob([1.0, 0.0, 0.0, 0.0]),),
+    )
+    conn.commit()
+    conn.execute("BEGIN")
+
+    def fail_release(_conn, _name):
+        raise sqlite3.OperationalError("synthetic release failure")
+
+    monkeypatch.setattr(integrity, "_release_savepoint", fail_release)
+    result = repair_integrity(
+        conn,
+        require_vec_parity=False,
+        actions={"remove_orphan_embeddings"},
+    )
+
+    assert result["status"] == "partial"
+    assert result["failures"]["savepoint_release_failed"] == 1
+    assert result["repairs"]["orphan_embeddings_removed"] == 0
+    assert conn.execute("SELECT COUNT(*) FROM embeddings").fetchone() == (1,)
+    conn.rollback()
+    conn.close()
+
+
+def test_repairs_require_a_caller_owned_outer_transaction(tmp_path: Path) -> None:
+    conn = _create_db(tmp_path / "transaction-required.db")
+
+    result = repair_integrity(conn, actions=set())
+
+    assert result == {
+        "status": "rejected",
+        "reason": "outer_transaction_required",
+        "transaction_owner": "caller",
+        "committed": False,
+    }
     conn.close()

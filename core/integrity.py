@@ -182,6 +182,8 @@ def _base_report(
             "orphan_embeddings": 0,
             "missing_vec": 0,
             "stale_vec": 0,
+            "invalid_vec": 0,
+            "vec_mismatched": 0,
             "orphan_edges": 0,
             "self_edges": 0,
             "permanent_and_decayed": 0,
@@ -212,6 +214,59 @@ def _base_report(
 
 def _record(mapping: dict[str, int], reason: str, amount: int = 1) -> None:
     mapping[reason] = mapping.get(reason, 0) + amount
+
+
+def _vectors_match(left: object, right: object, dimension: int) -> bool:
+    try:
+        left_values = np.frombuffer(bytes(left), dtype="<f4")
+        right_values = np.frombuffer(bytes(right), dtype="<f4")
+    except (TypeError, ValueError):
+        return False
+    if left_values.shape != (dimension,) or right_values.shape != (dimension,):
+        return False
+    return bool(np.array_equal(left_values, right_values))
+
+
+def _vec_issues(
+    conn: sqlite3.Connection,
+    *,
+    vec_dimension: int,
+    expected_dimension: int | None,
+) -> tuple[set[str], dict[str, int]]:
+    """Return vec node ids and per-row integrity findings.
+
+    The query is deliberately capped.  A caller that needs a complete audit
+    can repeat it with a profile-specific maintenance policy; repairs use the
+    same cap through ``batch_size``.
+    """
+    vec_ids: set[str] = set()
+    issues: dict[str, int] = {}
+    rows = conn.execute(
+        "SELECT v.node_id, v.embedding, e.vector, n.decayed "
+        "FROM vec_embeddings v "
+        "LEFT JOIN embeddings e ON e.node_id=v.node_id "
+        "LEFT JOIN thought_nodes n ON n.id=v.node_id "
+        "ORDER BY v.node_id LIMIT 1001"
+    ).fetchall()
+    for node_id, vector, ordinary, decayed in rows:
+        if node_id is not None:
+            node_id = str(node_id)
+            vec_ids.add(node_id)
+        if node_id is None or ordinary is None:
+            _record(issues, "vec_orphan")
+            continue
+        if decayed not in (None, 0):
+            _record(issues, "vec_stale_decayed")
+        reason = _decode_vector(vector, vec_dimension)
+        if reason is not None:
+            _record(issues, f"vec_{reason}")
+            continue
+        compare_dimension = expected_dimension or vec_dimension
+        if _decode_vector(ordinary, compare_dimension) is None and not _vectors_match(
+            vector, ordinary, vec_dimension
+        ):
+            _record(issues, "vec_value_mismatch")
+    return vec_ids, issues
 
 
 def inspect_integrity(
@@ -289,16 +344,26 @@ def inspect_integrity(
     ).fetchone()[0]
     counts["missing_embeddings"] = int(missing_count)
     if vec_status == "present" and _load_vec(conn):
-        vec_ids = {
-            str(row[0])
-            for row in conn.execute(
-                "SELECT node_id FROM vec_embeddings LIMIT 1001"
-            ).fetchall()
-            if row[0] is not None
-        }
+        vec_ids, vec_issues = _vec_issues(
+            conn,
+            vec_dimension=vec_dimension or 0,
+            expected_dimension=expected_dimension,
+        )
         active_embedding_ids = embedding_ids & set(active_nodes)
         counts["missing_vec"] = len(active_embedding_ids - vec_ids)
         counts["stale_vec"] = len(vec_ids - active_embedding_ids)
+        counts["invalid_vec"] = sum(
+            value
+            for reason, value in vec_issues.items()
+            if reason.startswith("vec_embedding_")
+        )
+        counts["vec_mismatched"] = vec_issues.get("vec_value_mismatch", 0)
+        for reason, value in vec_issues.items():
+            _record(report["reasons_by_kind"], reason, value)
+        if expected_dimension is not None and vec_dimension != expected_dimension:
+            report["reasons"].append("vec_dimension_mismatch")
+            _record(report["reasons_by_kind"], "vec_dimension_mismatch")
+            counts["invalid_vec"] += 1
     elif vec_status == "present":
         report["reasons"].append("vec_index_unverifiable")
     counts["orphan_edges"] = int(
@@ -326,7 +391,10 @@ def inspect_integrity(
             "WHERE node_type='core_memory' AND COALESCE(permanent,0)=0"
         ).fetchone()[0]
     )
-    report["status"] = "findings" if any(counts.values()) else "ok"
+    anomaly_keys = {
+        key for key in counts if key not in {"embeddings"}
+    }
+    report["status"] = "findings" if any(counts[key] for key in anomaly_keys) else "ok"
     report["uncertainty"] = ["historical_consolidation"]
     return report
 
@@ -383,6 +451,13 @@ def repair_integrity(
             "reason": "schema_tables_missing",
             "missing_tables": sorted(_REQUIRED_TABLES - tables),
         }
+    if not conn.in_transaction:
+        return {
+            "status": "rejected",
+            "reason": "outer_transaction_required",
+            "transaction_owner": "caller",
+            "committed": False,
+        }
 
     vec_status, vec_dimension, vec_reason = _vec_schema(conn)
     report = _base_report(
@@ -436,14 +511,47 @@ def repair_integrity(
             "WHERE node_type='core_memory' AND COALESCE(permanent,0)=0"
         ).fetchone()[0]
     )
-    vec_needed = bool(selected & {"repair_vec", "repair_embeddings"})
+    vec_operational = vec_status == "present" and _load_vec(conn)
     vec_ready = (
-        vec_status == "present"
-        and _load_vec(conn)
+        vec_operational
         and (expected_dimension is None or vec_dimension == expected_dimension)
     )
+    if vec_operational:
+        vec_ids, vec_issues = _vec_issues(
+            conn,
+            vec_dimension=vec_dimension or 0,
+            expected_dimension=expected_dimension,
+        )
+        active_embedding_ids = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT e.node_id FROM embeddings e "
+                "JOIN thought_nodes n ON n.id=e.node_id "
+                "WHERE n.decayed IS NULL OR n.decayed=0 LIMIT 1001"
+            ).fetchall()
+        }
+        counts["missing_vec"] = len(active_embedding_ids - vec_ids)
+        counts["stale_vec"] = len(vec_ids - active_embedding_ids)
+        counts["invalid_vec"] = sum(
+            value
+            for reason, value in vec_issues.items()
+            if reason.startswith("vec_embedding_")
+        )
+        counts["vec_mismatched"] = vec_issues.get("vec_value_mismatch", 0)
+        for reason, value in vec_issues.items():
+            _record(report["reasons_by_kind"], reason, value)
+        if expected_dimension is not None and vec_dimension != expected_dimension:
+            report["reasons"].append("vec_dimension_mismatch")
+            _record(report["reasons_by_kind"], "vec_dimension_mismatch")
+            counts["invalid_vec"] += 1
+    vec_needed = bool(selected & {"repair_vec", "repair_embeddings"})
     if vec_needed and require_vec_parity and not vec_ready:
-        report["reasons"].append(vec_reason or "vec_index_unverifiable")
+        if vec_reason:
+            report["reasons"].append(vec_reason)
+        elif expected_dimension is not None and vec_dimension not in (None, expected_dimension):
+            report["reasons"].append("vec_dimension_mismatch")
+        else:
+            report["reasons"].append("vec_index_unverifiable")
         skipped["vec_repairs"] = max_items
 
     def item_budget() -> bool:
@@ -452,47 +560,61 @@ def repair_integrity(
 
     def run_item(callback: Callable[[], None]) -> bool:
         index = report["limits"]["items_considered"]
-        name = _savepoint(conn, index)
+        try:
+            name = _savepoint(conn, index)
+        except (OSError, RuntimeError, sqlite3.Error, TypeError, ValueError) as exc:
+            _record(failures, "savepoint_begin_failed")
+            _record(failures, type(exc).__name__)
+            return False
         try:
             callback()
         except (OSError, RuntimeError, sqlite3.Error, TypeError, ValueError) as exc:
             try:
                 _rollback_savepoint(conn, name)
-            except sqlite3.Error:
+            except (OSError, RuntimeError, sqlite3.Error, TypeError, ValueError):
                 _record(failures, "savepoint_rollback_failed")
             _record(failures, type(exc).__name__)
             return False
-        _release_savepoint(conn, name)
+        try:
+            _release_savepoint(conn, name)
+        except (OSError, RuntimeError, sqlite3.Error, TypeError, ValueError) as exc:
+            _record(failures, "savepoint_release_failed")
+            _record(failures, type(exc).__name__)
+            try:
+                _rollback_savepoint(conn, name)
+            except (OSError, RuntimeError, sqlite3.Error, TypeError, ValueError):
+                _record(failures, "savepoint_rollback_failed")
+            return False
         report["mutated"] = True
         return True
 
-    # Remove embedding rows for deleted nodes first.  This is deterministic
-    # and needs no model.  The vec counterpart is removed in the same savepoint.
     if "remove_orphan_embeddings" in selected:
         orphan_rows = conn.execute(
-            "SELECT e.node_id FROM embeddings e "
+            "SELECT e.rowid, e.node_id FROM embeddings e "
             "LEFT JOIN thought_nodes n ON n.id=e.node_id "
             "WHERE n.id IS NULL ORDER BY e.node_id LIMIT ?",
             (min(batch_size, max_items),),
         ).fetchall()
         counts["orphan_embeddings"] = len(orphan_rows)
-        for (node_id,) in orphan_rows:
+        for rowid, node_id in orphan_rows:
             if not item_budget():
                 break
 
-            def remove_orphan(node_id=node_id) -> None:
-                conn.execute("DELETE FROM embeddings WHERE node_id=?", (node_id,))
-                if vec_ready:
+            def remove_orphan(rowid=rowid, node_id=node_id) -> None:
+                conn.execute("DELETE FROM embeddings WHERE rowid=?", (rowid,))
+                if conn.execute(
+                    "SELECT 1 FROM embeddings WHERE rowid=?", (rowid,)
+                ).fetchone() is not None:
+                    raise RuntimeError("orphan_embedding_not_removed")
+                if vec_ready and node_id is not None:
                     conn.execute("DELETE FROM vec_embeddings WHERE node_id=?", (node_id,))
 
             if run_item(remove_orphan):
                 repairs["orphan_embeddings_removed"] += 1
 
-    # Delete edges with missing endpoints.  Self-edges stay report-only unless
-    # the explicit action is selected.
     if "remove_orphan_edges" in selected:
         edge_rows = conn.execute(
-            "SELECT e.parent_id, e.child_id FROM derivation_edges e "
+            "SELECT e.rowid, e.parent_id, e.child_id FROM derivation_edges e "
             "LEFT JOIN thought_nodes p ON p.id=e.parent_id "
             "LEFT JOIN thought_nodes c ON c.id=e.child_id "
             "WHERE p.id IS NULL OR c.id IS NULL "
@@ -500,15 +622,16 @@ def repair_integrity(
             (min(batch_size, max_items),),
         ).fetchall()
         counts["orphan_edges"] = len(edge_rows)
-        for parent_id, child_id in edge_rows:
+        for rowid, _parent_id, _child_id in edge_rows:
             if not item_budget():
                 break
 
-            def remove_edge(parent_id=parent_id, child_id=child_id) -> None:
-                conn.execute(
-                    "DELETE FROM derivation_edges WHERE parent_id=? AND child_id=?",
-                    (parent_id, child_id),
-                )
+            def remove_edge(rowid=rowid) -> None:
+                conn.execute("DELETE FROM derivation_edges WHERE rowid=?", (rowid,))
+                if conn.execute(
+                    "SELECT 1 FROM derivation_edges WHERE rowid=?", (rowid,)
+                ).fetchone() is not None:
+                    raise RuntimeError("orphan_edge_not_removed")
 
             if run_item(remove_edge):
                 repairs["orphan_edges_removed"] += 1
@@ -532,24 +655,70 @@ def repair_integrity(
             if run_item(remove_self):
                 repairs["self_edges_removed"] += 1
 
-    if vec_ready and "repair_vec" in selected:
+    if vec_operational and "repair_vec" in selected:
         rows = conn.execute(
-            "SELECT v.node_id FROM vec_embeddings v "
-            "LEFT JOIN thought_nodes n ON n.id=v.node_id "
+            "SELECT v.node_id, v.embedding, e.vector, n.decayed "
+            "FROM vec_embeddings v "
             "LEFT JOIN embeddings e ON e.node_id=v.node_id "
-            "WHERE n.id IS NULL OR e.node_id IS NULL "
-            "OR n.decayed != 0 LIMIT ?",
+            "LEFT JOIN thought_nodes n ON n.id=v.node_id "
+            "ORDER BY v.node_id LIMIT ?",
             (min(batch_size, max_items),),
         ).fetchall()
-        for (node_id,) in rows:
+        for node_id, vector, ordinary, decayed in rows:
             if not item_budget():
                 break
+            vector_reason = _decode_vector(vector, vec_dimension)
+            ordinary_reason = (
+                _decode_vector(ordinary, expected_dimension or vec_dimension)
+                if ordinary is not None
+                else "embedding_missing"
+            )
+            stale = node_id is None or ordinary is None or decayed not in (None, 0)
+            mismatched = (
+                not stale
+                and vector_reason is None
+                and ordinary_reason is None
+                and not _vectors_match(vector, ordinary, vec_dimension)
+            )
+            invalid = vector_reason is not None or mismatched
+            if not stale and not invalid:
+                continue
+            replacement = (
+                ordinary
+                if not stale
+                and ordinary_reason is None
+                and vec_ready
+                and expected_dimension in (None, vec_dimension)
+                else None
+            )
 
-            def remove_vec(node_id=node_id) -> None:
-                conn.execute("DELETE FROM vec_embeddings WHERE node_id=?", (node_id,))
+            def replace_vec(node_id=node_id, replacement=replacement) -> None:
+                if node_id is None:
+                    conn.execute("DELETE FROM vec_embeddings WHERE node_id IS NULL")
+                    remaining = conn.execute(
+                        "SELECT 1 FROM vec_embeddings WHERE node_id IS NULL"
+                    ).fetchone()
+                else:
+                    conn.execute(
+                        "DELETE FROM vec_embeddings WHERE node_id=?", (node_id,)
+                    )
+                    remaining = conn.execute(
+                        "SELECT 1 FROM vec_embeddings WHERE node_id=?", (node_id,)
+                    ).fetchone()
+                if remaining is not None:
+                    raise RuntimeError("vec_row_not_removed")
+                if replacement is not None:
+                    conn.execute(
+                        "INSERT INTO vec_embeddings(node_id, embedding) "
+                        "SELECT node_id, ? FROM embeddings WHERE node_id=?",
+                        (replacement, node_id),
+                    )
 
-            if run_item(remove_vec):
+            if run_item(replace_vec):
                 repairs["vec_rows_removed"] += 1
+                if replacement is not None:
+                    repairs["vec_rows_inserted"] += 1
+
         valid_rows = conn.execute(
             "SELECT e.node_id, e.vector, e.model FROM embeddings e "
             "JOIN thought_nodes n ON n.id=e.node_id "
@@ -561,11 +730,13 @@ def repair_integrity(
         for node_id, blob, model in valid_rows:
             if not item_budget():
                 break
-            reason = _decode_vector(blob, expected_dimension)
-            if reason is not None or (
-                embedding_model is not None and model != embedding_model
+            reason = _decode_vector(blob, expected_dimension or vec_dimension)
+            if (
+                reason is not None
+                or not vec_ready
+                or (embedding_model is not None and model != embedding_model)
             ):
-                _record(skipped, reason or "embedding_model_mismatch")
+                _record(skipped, reason or "vec_dimension_mismatch")
                 continue
 
             def insert_vec(node_id=node_id, blob=blob) -> None:
@@ -668,7 +839,40 @@ def repair_integrity(
             if run_item(promote_core):
                 repairs["core_memories_promoted"] += 1
 
-    report["status"] = "partial" if skipped or failures else "completed"
+    remaining_report = inspect_integrity(
+        conn,
+        expected_model=embedding_model,
+        expected_dimension=expected_dimension,
+    )
+    remaining_counts = remaining_report.get("counts", {})
+    report["remaining"] = {
+        key: value
+        for key, value in remaining_counts.items()
+        if key != "embeddings" and value
+    }
+    actionable_keys = set()
+    if "remove_orphan_embeddings" in selected:
+        actionable_keys.add("orphan_embeddings")
+    if "remove_orphan_edges" in selected:
+        actionable_keys.add("orphan_edges")
+    if "repair_vec" in selected:
+        actionable_keys.update(
+            {"missing_vec", "stale_vec", "invalid_vec", "vec_mismatched"}
+        )
+    if "repair_embeddings" in selected:
+        actionable_keys.update({"missing_embeddings", "invalid_embeddings"})
+    if "remove_self_edges" in selected:
+        actionable_keys.add("self_edges")
+    if permanence_policy != "report":
+        actionable_keys.add("permanent_and_decayed")
+    if "promote_core_memories" in selected:
+        actionable_keys.add("core_memory_not_permanent")
+    remaining_actionable = any(
+        remaining_counts.get(key, 0) for key in actionable_keys
+    )
+    report["status"] = (
+        "partial" if skipped or failures or remaining_actionable else "completed"
+    )
     report["uncertainty"] = ["historical_consolidation", "commit_owned_by_caller"]
     return report
 
